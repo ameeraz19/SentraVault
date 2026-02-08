@@ -1,0 +1,54 @@
+{
+  "expo": {
+    "name": "SentraVault",
+    "slug": "sentravault",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "sentravault",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.sentravault.app",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "SentraVault needs access to your photos and videos to import them into your secure vault.",
+        "NSPhotoLibraryAddUsageDescription": "SentraVault needs permission to save photos and videos.",
+        "NSFaceIDUsageDescription": "SentraVault uses Face ID for secure authentication."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "package": "com.sentravault.app"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "SentraVault needs access to your photos and videos.",
+          "savePhotosPermission": "SentraVault needs permission to save media.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ],
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "SentraVault uses Face ID for secure authentication."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

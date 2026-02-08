@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(if exist node_modules rmdir /s /q node_modules)",
+      "Bash(if exist package-lock.json del package-lock.json)",
+      "Bash(npm install)",
+      "Bash(dir:*)",
+      "WebFetch(domain:diko-dev99.medium.com)",
+      "WebFetch(domain:iifx.dev)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:expo.dev)",
+      "Bash(ls:*)"
+    ]
+  }
+}
