@@ -9,132 +9,61 @@ import {
   ScrollView,
   StatusBar,
 } from 'react-native';
-import { Image } from 'expo-image';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import * as DocumentPicker from 'expo-document-picker';
+import * as Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
 import { useAuthStore } from '../../src/store';
 import { useMediaStore } from '../../src/store/mediaStore';
 import { colors, spacing, radius } from '../../src/theme';
-import { MediaViewer } from '../../src/components/MediaViewer';
-
-interface MountedFile {
-  id: string;
-  uri: string;
-  name: string;
-  type: 'photo' | 'video';
-  mimeType: string;
-}
+import { getContainerPath } from '../../src/utils/containerFormat';
 
 export default function USBScreen() {
-  const { vaultType } = useAuthStore();
-  const { importFromUSB, importVaultFiles, exportAllToUSB, media, previewVaultFile, cleanupPreviews } = useMediaStore();
+  const { vaultType, getCredentials } = useAuthStore();
+  const { media, exportVault, exportSelection } = useMediaStore();
+
   const [loading, setLoading] = useState(false);
-  const [action, setAction] = useState<'import' | 'importVault' | 'export' | 'view' | null>(null);
-  const [mountedFiles, setMountedFiles] = useState<MountedFile[]>([]);
-  const [viewerVisible, setViewerVisible] = useState(false);
-  const [viewerIndex, setViewerIndex] = useState(0);
+  const [action, setAction] = useState<'exportAll' | 'exportSelection' | null>(null);
 
-  // Import regular media files (photos/videos)
-  const handleImportMedia = async () => {
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setLoading(true);
-    setAction('import');
-
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ['image/*', 'video/*'],
-        multiple: true,
-        copyToCacheDirectory: true,
-      });
-
-      if (!result.canceled && result.assets.length > 0) {
-        await importFromUSB(result.assets, vaultType || 'real');
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        Alert.alert(
-          'Import Complete',
-          `${result.assets.length} file(s) added to your vault`
-        );
-      }
-    } catch (error) {
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      Alert.alert('Error', 'Failed to import files');
-    } finally {
-      setLoading(false);
-      setAction(null);
-    }
-  };
-
-  // Import .svault bundle files
-  const handleImportVaultFiles = async () => {
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setLoading(true);
-    setAction('importVault');
-
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ['application/json', 'application/octet-stream', '*/*'],
-        multiple: true,
-        copyToCacheDirectory: true,
-      });
-
-      if (!result.canceled && result.assets.length > 0) {
-        // Filter for .svault files
-        const vaultFiles = result.assets.filter(
-          (f) => f.name?.endsWith('.svault') || f.name?.endsWith('.json')
-        );
-
-        if (vaultFiles.length === 0) {
-          Alert.alert('No Vault Files', 'Please select .svault files exported from SentraVault');
-          return;
-        }
-
-        await importVaultFiles(vaultFiles, vaultType || 'real');
-        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        Alert.alert(
-          'Import Complete',
-          `${vaultFiles.length} vault file(s) restored`
-        );
-      }
-    } catch (error) {
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      Alert.alert('Error', 'Failed to import vault files. Make sure they are valid .svault files.');
-    } finally {
-      setLoading(false);
-      setAction(null);
-    }
-  };
-
-  // Export all vault items as .svault bundles
-  const handleExport = async () => {
+  // Export entire vault (share the container file)
+  const handleExportAll = async () => {
     if (media.length === 0) {
-      Alert.alert('No Media', 'Your vault is empty.');
+      Alert.alert('Empty Vault', 'Your vault is empty. Add some files first.');
       return;
     }
 
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
-    const message = media.length === 1
-      ? 'Export 1 item as .svault file?'
-      : `Export all ${media.length} items into a single .svault file?`;
-
     Alert.alert(
       'Export Vault',
-      message,
+      `Share your entire vault (${media.length} items) as a .svault file?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Export',
           onPress: async () => {
             setLoading(true);
-            setAction('export');
+            setAction('exportAll');
             try {
-              await exportAllToUSB(vaultType || 'real');
+              const vaultPath = await exportVault();
+
+              const isAvailable = await Sharing.isAvailableAsync();
+              if (!isAvailable) {
+                Alert.alert('Error', 'Sharing is not available on this device');
+                return;
+              }
+
+              await Sharing.shareAsync(vaultPath, {
+                mimeType: 'application/octet-stream',
+                dialogTitle: 'Export Vault',
+                UTI: 'public.data',
+              });
+
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
             } catch (error) {
+              console.error('Export failed:', error);
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-              Alert.alert('Error', 'Failed to export');
+              Alert.alert('Error', 'Failed to export vault');
             } finally {
               setLoading(false);
               setAction(null);
@@ -145,85 +74,66 @@ export default function USBScreen() {
     );
   };
 
-  // View external files without importing (supports .svault files too)
-  const handleViewExternal = async () => {
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setAction('view');
-
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ['image/*', 'video/*', 'application/json', 'application/octet-stream', '*/*'],
-        multiple: true,
-        copyToCacheDirectory: true,
-      });
-
-      if (!result.canceled && result.assets.length > 0) {
-        const files: MountedFile[] = [];
-
-        for (const asset of result.assets) {
-          // Check if it's a .svault file
-          if (asset.name?.endsWith('.svault')) {
-            try {
-              // Decode and create temp preview files
-              const previews = await previewVaultFile(asset.uri);
-              for (const preview of previews) {
-                files.push({
-                  id: preview.id,
-                  uri: preview.uri,
-                  name: preview.originalName,
-                  type: preview.type,
-                  mimeType: preview.type === 'video' ? 'video/mp4' : 'image/jpeg',
-                });
-              }
-            } catch (error) {
-              console.error('Failed to preview vault file:', error);
-              Alert.alert('Error', 'Failed to read .svault file');
-            }
-          } else {
-            // Regular media file
-            files.push({
-              id: `external-${files.length}-${Date.now()}`,
-              uri: asset.uri,
-              name: asset.name || 'Unknown',
-              type: asset.mimeType?.startsWith('video/') ? 'video' : 'photo',
-              mimeType: asset.mimeType || 'image/jpeg',
-            });
-          }
-        }
-
-        if (files.length > 0) {
-          setMountedFiles(files);
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        }
-      }
-    } catch (error) {
-      Alert.alert('Error', 'Failed to open files');
-    } finally {
-      setAction(null);
+  // Export selected items (create new .svault with selection)
+  const handleExportSelection = async () => {
+    if (media.length === 0) {
+      Alert.alert('Empty Vault', 'Your vault is empty. Add some files first.');
+      return;
     }
-  };
 
-  const clearMounted = async () => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    setMountedFiles([]);
-    // Clean up any temp preview files
-    await cleanupPreviews();
-  };
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
-  const openFile = (index: number) => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    setViewerIndex(index);
-    setViewerVisible(true);
-  };
+    // For now, export all - in future can add selection UI
+    const credentials = getCredentials();
+    if (!credentials) {
+      Alert.alert('Error', 'Not authenticated');
+      return;
+    }
 
-  // Transform mounted files to MediaViewer format
-  const viewerMedia = mountedFiles.map((file) => ({
-    id: file.id,
-    type: file.type,
-    encryptedPath: file.uri,
-    originalName: file.name,
-    createdAt: Date.now(),
-  }));
+    Alert.alert(
+      'Export Selection',
+      'This will create a new .svault file with all items. In a future update, you can select specific items to export.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Export All',
+          onPress: async () => {
+            setLoading(true);
+            setAction('exportSelection');
+            try {
+              const allIds = media.map((m) => m.id);
+              const exportPath = await exportSelection(
+                allIds,
+                credentials.password,
+                credentials.secretKey
+              );
+
+              const isAvailable = await Sharing.isAvailableAsync();
+              if (!isAvailable) {
+                Alert.alert('Error', 'Sharing is not available on this device');
+                return;
+              }
+
+              await Sharing.shareAsync(exportPath, {
+                mimeType: 'application/octet-stream',
+                dialogTitle: 'Export Selection',
+                UTI: 'public.data',
+              });
+
+              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+            } catch (error) {
+              console.error('Export failed:', error);
+              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+              Alert.alert('Error', 'Failed to export selection');
+            } finally {
+              setLoading(false);
+              setAction(null);
+            }
+          },
+        },
+      ]
+    );
+  };
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -232,110 +142,58 @@ export default function USBScreen() {
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.title}>Files</Text>
-        </View>
-
-        {/* Import Section */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Import</Text>
-
-          <ActionRow
-            icon="images-outline"
-            title="Import Media"
-            subtitle="Add photos & videos to vault"
-            onPress={handleImportMedia}
-            loading={loading && action === 'import'}
-            disabled={loading}
-          />
-
-          <ActionRow
-            icon="archive-outline"
-            title="Restore Backup"
-            subtitle="Import .svault files"
-            onPress={handleImportVaultFiles}
-            loading={loading && action === 'importVault'}
-            disabled={loading}
-          />
+          <Text style={styles.title}>Backup</Text>
+          <Text style={styles.subtitle}>{media.length} items in vault</Text>
         </View>
 
         {/* Export Section */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Export</Text>
+          <Text style={styles.sectionTitle}>Export Options</Text>
 
           <ActionRow
-            icon="share-outline"
-            title="Backup Vault"
-            subtitle={`Export ${media.length} items as single .svault file`}
-            onPress={handleExport}
-            loading={loading && action === 'export'}
+            icon="cloud-download-outline"
+            title="Export Entire Vault"
+            subtitle="Share your vault.svault file"
+            onPress={handleExportAll}
+            loading={loading && action === 'exportAll'}
+            disabled={loading || media.length === 0}
+          />
+
+          <ActionRow
+            icon="document-attach-outline"
+            title="Export Selection"
+            subtitle="Create new .svault with selected items"
+            onPress={handleExportSelection}
+            loading={loading && action === 'exportSelection'}
             disabled={loading || media.length === 0}
           />
         </View>
 
-        {/* View Section */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Preview</Text>
-
-          <ActionRow
-            icon="eye-outline"
-            title="View External"
-            subtitle="Preview media or .svault files"
-            onPress={handleViewExternal}
-            disabled={loading}
-          />
-        </View>
-
-        {/* Mounted Files Section */}
-        {mountedFiles.length > 0 && (
-          <View style={styles.section}>
-            <View style={styles.sectionHeader}>
-              <Text style={styles.sectionLabel}>
-                {mountedFiles.length} {mountedFiles.length === 1 ? 'file' : 'files'}
+        {/* Info Section */}
+        <View style={styles.infoSection}>
+          <View style={styles.infoCard}>
+            <Ionicons name="information-circle-outline" size={24} color={colors.primary} />
+            <View style={styles.infoContent}>
+              <Text style={styles.infoTitle}>About .svault files</Text>
+              <Text style={styles.infoText}>
+                Your vault is stored as an encrypted .svault file. You can share this file to back
+                it up, then import it later using the + button on the Vault tab.
               </Text>
-              <TouchableOpacity onPress={clearMounted}>
-                <Text style={styles.clearText}>Clear</Text>
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.filesGrid}>
-              {mountedFiles.map((file, index) => (
-                <TouchableOpacity
-                  key={file.id}
-                  style={styles.fileItem}
-                  onPress={() => openFile(index)}
-                  activeOpacity={0.7}
-                >
-                  <Image
-                    source={{ uri: file.uri }}
-                    style={styles.fileThumbnail}
-                    contentFit="cover"
-                  />
-                  {file.type === 'video' && (
-                    <View style={styles.videoIndicator}>
-                      <Ionicons name="play" size={12} color={colors.text} />
-                    </View>
-                  )}
-                </TouchableOpacity>
-              ))}
             </View>
           </View>
-        )}
 
-        {/* Info */}
-        <View style={styles.infoSection}>
-          <Text style={styles.infoText}>
-            Export creates .svault files that can be restored later using "Restore Backup"
-          </Text>
+          <View style={styles.infoCard}>
+            <Ionicons name="shield-checkmark-outline" size={24} color={colors.success} />
+            <View style={styles.infoContent}>
+              <Text style={styles.infoTitle}>Secure & Encrypted</Text>
+              <Text style={styles.infoText}>
+                Files are encrypted with AES-256. You'll need your password to access them on
+                another device.
+              </Text>
+            </View>
+          </View>
         </View>
       </ScrollView>
-
-      {/* Gesture-based Media Viewer */}
-      <MediaViewer
-        visible={viewerVisible}
-        media={viewerMedia}
-        initialIndex={viewerIndex}
-        onClose={() => setViewerVisible(false)}
-      />
     </SafeAreaView>
   );
 }
@@ -391,6 +249,11 @@ const styles = StyleSheet.create({
     color: colors.text,
     letterSpacing: -0.5,
   },
+  subtitle: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    marginTop: 4,
+  },
   section: {
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.lg,
@@ -402,21 +265,6 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.5,
     marginBottom: spacing.sm,
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: spacing.md,
-  },
-  sectionLabel: {
-    fontSize: 14,
-    color: colors.textSecondary,
-  },
-  clearText: {
-    fontSize: 14,
-    color: colors.primary,
-    fontWeight: '500',
   },
   actionRow: {
     flexDirection: 'row',
@@ -454,42 +302,30 @@ const styles = StyleSheet.create({
   textDisabled: {
     color: colors.textTertiary,
   },
-  filesGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    marginHorizontal: -2,
-  },
-  fileItem: {
-    width: '31.5%',
-    aspectRatio: 1,
-    margin: '0.9%',
-    borderRadius: radius.sm,
-    overflow: 'hidden',
-    backgroundColor: colors.surface,
-  },
-  fileThumbnail: {
-    width: '100%',
-    height: '100%',
-  },
-  videoIndicator: {
-    position: 'absolute',
-    bottom: 6,
-    left: 6,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
   infoSection: {
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.xl,
+    gap: spacing.md,
+  },
+  infoCard: {
+    flexDirection: 'row',
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    gap: spacing.md,
+  },
+  infoContent: {
+    flex: 1,
+  },
+  infoTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.text,
+    marginBottom: spacing.xs,
   },
   infoText: {
     fontSize: 13,
-    color: colors.textTertiary,
-    textAlign: 'center',
+    color: colors.textSecondary,
     lineHeight: 18,
   },
 });

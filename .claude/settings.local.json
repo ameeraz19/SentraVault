@@ -9,7 +9,8 @@
       "WebFetch(domain:iifx.dev)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:expo.dev)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(npm install:*)"
     ]
   }
 }

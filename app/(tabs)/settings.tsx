@@ -13,6 +13,8 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router } from 'expo-router';
 import * as Haptics from 'expo-haptics';
+import * as SecureStore from 'expo-secure-store';
+import * as FileSystem from 'expo-file-system/legacy';
 import { useAuthStore } from '../../src/store';
 import { useMediaStore } from '../../src/store/mediaStore';
 import { colors, spacing, radius } from '../../src/theme';
@@ -60,6 +62,81 @@ export default function SettingsScreen() {
                       Haptics.NotificationFeedbackType.Success
                     );
                     Alert.alert('Done', 'All data deleted.');
+                  },
+                },
+              ]
+            );
+          },
+        },
+      ]
+    );
+  };
+
+  const handleResetApp = async () => {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    Alert.alert(
+      'Reset App',
+      'This will delete ALL data including your vault password and start fresh. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reset Everything',
+          style: 'destructive',
+          onPress: () => {
+            Alert.alert(
+              'Are you absolutely sure?',
+              'All encrypted files, passwords, and settings will be permanently deleted.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Yes, Reset App',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      // Clear all SecureStore items (both old and new prefixes)
+                      await SecureStore.deleteItemAsync('sv2_salt');
+                      await SecureStore.deleteItemAsync('sv2_real_hash');
+                      await SecureStore.deleteItemAsync('sv2_decoy_hash');
+                      await SecureStore.deleteItemAsync('sv2_setup_complete');
+                      await SecureStore.deleteItemAsync('sv2_secret_key');
+                      // Also clear old keys (in case they exist)
+                      await SecureStore.deleteItemAsync('salt');
+                      await SecureStore.deleteItemAsync('real_hash');
+                      await SecureStore.deleteItemAsync('decoy_hash');
+                      await SecureStore.deleteItemAsync('setup_complete');
+                      await SecureStore.deleteItemAsync('sentravault_secret_key');
+
+                      // Delete containers directory
+                      const containersDir = `${FileSystem.documentDirectory}containers/`;
+                      const dirInfo = await FileSystem.getInfoAsync(containersDir);
+                      if (dirInfo.exists) {
+                        await FileSystem.deleteAsync(containersDir, { idempotent: true });
+                      }
+
+                      // Delete temp directory
+                      const tempDir = `${FileSystem.documentDirectory}temp/`;
+                      const tempInfo = await FileSystem.getInfoAsync(tempDir);
+                      if (tempInfo.exists) {
+                        await FileSystem.deleteAsync(tempDir, { idempotent: true });
+                      }
+
+                      // Delete old encrypted files directory (legacy)
+                      const encryptedDir = `${FileSystem.documentDirectory}encrypted/`;
+                      const encInfo = await FileSystem.getInfoAsync(encryptedDir);
+                      if (encInfo.exists) {
+                        await FileSystem.deleteAsync(encryptedDir, { idempotent: true });
+                      }
+
+                      await Haptics.notificationAsync(
+                        Haptics.NotificationFeedbackType.Success
+                      );
+
+                      // Navigate to setup
+                      router.replace('/(auth)/setup');
+                    } catch (error) {
+                      console.error('Reset failed:', error);
+                      Alert.alert('Error', 'Failed to reset app. Please try again.');
+                    }
                   },
                 },
               ]
@@ -179,6 +256,21 @@ export default function SettingsScreen() {
             <View style={styles.rowContent}>
               <Text style={[styles.rowTitle, styles.dangerText]}>Erase Vault</Text>
               <Text style={styles.rowSubtitle}>Delete all data permanently</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={20} color={colors.error} />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.row}
+            onPress={handleResetApp}
+            activeOpacity={0.6}
+          >
+            <View style={styles.rowIcon}>
+              <Ionicons name="nuclear-outline" size={22} color={colors.error} />
+            </View>
+            <View style={styles.rowContent}>
+              <Text style={[styles.rowTitle, styles.dangerText]}>Reset App</Text>
+              <Text style={styles.rowSubtitle}>Delete everything and start fresh</Text>
             </View>
             <Ionicons name="chevron-forward" size={20} color={colors.error} />
           </TouchableOpacity>

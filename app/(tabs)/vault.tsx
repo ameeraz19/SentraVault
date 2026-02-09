@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -8,13 +8,18 @@ import {
   Dimensions,
   RefreshControl,
   StatusBar,
+  AppState,
+  Alert,
+  ActivityIndicator,
+  ViewToken,
 } from 'react-native';
 import { Image } from 'expo-image';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
+import * as Sharing from 'expo-sharing';
 import { useAuthStore } from '../../src/store';
-import { useMediaStore } from '../../src/store/mediaStore';
+import { useMediaStore, MediaItem } from '../../src/store/mediaStore';
 import { colors, spacing, radius } from '../../src/theme';
 import { FAB } from '../../src/components/ui';
 import { MediaViewer } from '../../src/components/MediaViewer';
@@ -25,35 +30,98 @@ const COLUMN_COUNT = 3;
 const GAP = 2;
 const ITEM_SIZE = (width - GAP * (COLUMN_COUNT + 1)) / COLUMN_COUNT;
 
-interface MediaItem {
-  id: string;
-  type: 'photo' | 'video';
-  encryptedPath: string;
-  originalName: string;
-  duration?: number;
-  createdAt: number;
-}
-
 export default function VaultScreen() {
-  const { vaultType } = useAuthStore();
-  const { media, loading, loadMedia, refreshMedia, deleteMedia } = useMediaStore();
+  const { vaultType, lock } = useAuthStore();
+  const {
+    media,
+    loading,
+    importing,
+    importProgress,
+    thumbnailCache,
+    loadThumbnails,
+    getThumbnailPath,
+    getFilePath,
+    deleteMedia,
+    refreshMedia,
+  } = useMediaStore();
+
   const [refreshing, setRefreshing] = useState(false);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [localThumbnails, setLocalThumbnails] = useState<Map<string, string>>(new Map());
 
   // Modal states
   const [importVisible, setImportVisible] = useState(false);
   const [viewerVisible, setViewerVisible] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
 
+  // Track visible items for lazy loading
+  const visibleItemsRef = useRef<Set<string>>(new Set());
+
+  // Sync thumbnailCache to localThumbnails
   useEffect(() => {
-    loadMedia(vaultType || 'real');
-  }, [vaultType]);
+    setLocalThumbnails(new Map(thumbnailCache));
+  }, [thumbnailCache]);
+
+  // Clean up on app background
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', async (nextAppState) => {
+      if (nextAppState === 'background' || nextAppState === 'inactive') {
+        // Lock the vault when going to background
+        await lock();
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, [lock]);
+
+  // Handle viewable items change for lazy loading
+  const onViewableItemsChanged = useCallback(
+    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
+      const visibleIds = viewableItems
+        .filter((item) => item.isViewable && item.item)
+        .map((item) => (item.item as MediaItem).id);
+
+      visibleItemsRef.current = new Set(visibleIds);
+
+      // Load thumbnails for visible items + buffer
+      const itemsToLoad: string[] = [];
+      const bufferSize = 20;
+
+      viewableItems.forEach((viewToken) => {
+        if (viewToken.index !== null && viewToken.item) {
+          const startIdx = Math.max(0, viewToken.index - bufferSize);
+          const endIdx = Math.min(media.length, viewToken.index + bufferSize);
+
+          for (let i = startIdx; i < endIdx; i++) {
+            const item = media[i];
+            if (item && !thumbnailCache.has(item.id) && item.thumbnailPath) {
+              itemsToLoad.push(item.id);
+            }
+          }
+        }
+      });
+
+      // Load in batches
+      if (itemsToLoad.length > 0) {
+        const firstVisible = viewableItems[0]?.index || 0;
+        loadThumbnails(Math.max(0, firstVisible - bufferSize), bufferSize * 2 + viewableItems.length);
+      }
+    },
+    [media, thumbnailCache, loadThumbnails]
+  );
+
+  const viewabilityConfig = useRef({
+    itemVisiblePercentThreshold: 10,
+    minimumViewTime: 100,
+  }).current;
 
   const handleRefresh = async () => {
     setRefreshing(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    await refreshMedia(vaultType || 'real');
+    await refreshMedia();
     setRefreshing(false);
   };
 
@@ -63,6 +131,37 @@ export default function VaultScreen() {
       return;
     }
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+
+    // For non-media files (type === 'file'), open in system viewer via Share sheet
+    if (item.type === 'file') {
+      try {
+        // Extract the file first
+        const filePath = await getFilePath(item.id);
+        if (!filePath) {
+          Alert.alert('Error', 'Failed to extract file');
+          return;
+        }
+
+        // Check if sharing is available
+        const isAvailable = await Sharing.isAvailableAsync();
+        if (!isAvailable) {
+          Alert.alert('Error', 'Sharing is not available on this device');
+          return;
+        }
+
+        // Open share sheet with the extracted file
+        await Sharing.shareAsync(filePath, {
+          mimeType: item.mimeType || 'application/octet-stream',
+          dialogTitle: item.originalName,
+        });
+      } catch (error) {
+        console.error('Failed to share file:', error);
+        Alert.alert('Error', 'Failed to open file');
+      }
+      return;
+    }
+
+    // For photos and videos, open MediaViewer
     setViewerIndex(index);
     setViewerVisible(true);
   };
@@ -94,18 +193,27 @@ export default function VaultScreen() {
   const handleDelete = async () => {
     if (selectedIds.size === 0) return;
 
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-
-    for (const id of selectedIds) {
-      await deleteMedia(id);
-    }
-
-    exitSelectionMode();
-    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    Alert.alert(
+      'Delete Items',
+      `Delete ${selectedIds.size} item(s)? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+            await deleteMedia(Array.from(selectedIds));
+            exitSelectionMode();
+            await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          },
+        },
+      ]
+    );
   };
 
   const handleViewerDelete = async (id: string) => {
-    await deleteMedia(id);
+    await deleteMedia([id]);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     // If no more media, close viewer
     if (media.length <= 1) {
@@ -115,6 +223,12 @@ export default function VaultScreen() {
 
   const renderItem = ({ item, index }: { item: MediaItem; index: number }) => {
     const isSelected = selectedIds.has(item.id);
+    const isFile = item.type === 'file';
+    const fileExtension = item.fileExtension?.toUpperCase() || 'FILE';
+
+    // Get thumbnail from cache
+    const thumbnailPath = localThumbnails.get(item.id);
+    const isLoadingThumb = !thumbnailPath && !isFile && item.thumbnailPath;
 
     return (
       <TouchableOpacity
@@ -123,24 +237,47 @@ export default function VaultScreen() {
         onLongPress={() => enterSelectionMode(item.id)}
         activeOpacity={0.8}
       >
-        <Image
-          source={{ uri: item.encryptedPath }}
-          style={[styles.thumbnail, isSelected && styles.thumbnailSelected]}
-          contentFit="cover"
-          transition={150}
-        />
-        {item.type === 'video' && item.duration && (
-          <View style={styles.durationBadge}>
-            <Text style={styles.durationText}>
-              {formatDuration(item.duration)}
-            </Text>
+        {isFile ? (
+          // File type - show extension badge instead of thumbnail
+          <View style={styles.filePlaceholder}>
+            <Ionicons name="document-outline" size={28} color={colors.textTertiary} />
+            <View style={styles.extensionBadge}>
+              <Text style={styles.extensionText}>.{fileExtension}</Text>
+            </View>
+          </View>
+        ) : isLoadingThumb ? (
+          // Loading placeholder
+          <View style={styles.thumbnailPlaceholder}>
+            <ActivityIndicator size="small" color={colors.textTertiary} />
+          </View>
+        ) : thumbnailPath ? (
+          // Show thumbnail
+          <Image
+            source={{ uri: thumbnailPath }}
+            style={[styles.thumbnail, isSelected && styles.thumbnailSelected]}
+            contentFit="cover"
+            transition={150}
+          />
+        ) : (
+          // No thumbnail - show placeholder
+          <View style={styles.thumbnailPlaceholder}>
+            <Ionicons
+              name={item.type === 'video' ? 'videocam-outline' : 'image-outline'}
+              size={24}
+              color={colors.textTertiary}
+            />
           </View>
         )}
+
+        {item.type === 'video' && item.duration && (
+          <View style={styles.durationBadge}>
+            <Text style={styles.durationText}>{formatDuration(item.duration)}</Text>
+          </View>
+        )}
+
         {selectionMode && (
           <View style={[styles.checkbox, isSelected && styles.checkboxSelected]}>
-            {isSelected && (
-              <Ionicons name="checkmark" size={14} color={colors.text} />
-            )}
+            {isSelected && <Ionicons name="checkmark" size={14} color={colors.text} />}
           </View>
         )}
       </TouchableOpacity>
@@ -153,9 +290,7 @@ export default function VaultScreen() {
         <Ionicons name="lock-closed-outline" size={32} color={colors.textTertiary} />
       </View>
       <Text style={styles.emptyTitle}>No items yet</Text>
-      <Text style={styles.emptySubtitle}>
-        Tap + to import photos and videos
-      </Text>
+      <Text style={styles.emptySubtitle}>Tap + to import photos, videos, or files</Text>
     </View>
   );
 
@@ -166,9 +301,7 @@ export default function VaultScreen() {
           <TouchableOpacity onPress={exitSelectionMode} style={styles.headerButton}>
             <Text style={styles.cancelText}>Cancel</Text>
           </TouchableOpacity>
-          <Text style={styles.selectionCount}>
-            {selectedIds.size} selected
-          </Text>
+          <Text style={styles.selectionCount}>{selectedIds.size} selected</Text>
           <TouchableOpacity onPress={handleDelete} style={styles.headerButton}>
             <Text style={styles.deleteText}>Delete</Text>
           </TouchableOpacity>
@@ -183,11 +316,25 @@ export default function VaultScreen() {
               </Text>
             )}
           </View>
-          <View style={styles.headerRight} />
+          <TouchableOpacity onPress={() => lock()} style={styles.headerButton}>
+            <Ionicons name="lock-closed-outline" size={22} color={colors.textSecondary} />
+          </TouchableOpacity>
         </>
       )}
     </View>
   );
+
+  if (loading) {
+    return (
+      <SafeAreaView style={styles.container} edges={['top']}>
+        <StatusBar barStyle="light-content" />
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={styles.loadingText}>Opening vault...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -199,10 +346,7 @@ export default function VaultScreen() {
         renderItem={renderItem}
         keyExtractor={(item) => item.id}
         numColumns={COLUMN_COUNT}
-        contentContainerStyle={[
-          styles.grid,
-          media.length === 0 && styles.gridEmpty,
-        ]}
+        contentContainerStyle={[styles.grid, media.length === 0 && styles.gridEmpty]}
         ListEmptyComponent={renderEmpty}
         refreshControl={
           <RefreshControl
@@ -212,12 +356,16 @@ export default function VaultScreen() {
           />
         }
         showsVerticalScrollIndicator={false}
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={viewabilityConfig}
+        removeClippedSubviews={true}
+        maxToRenderPerBatch={12}
+        windowSize={5}
+        initialNumToRender={18}
       />
 
       {/* FAB - Import button */}
-      {!selectionMode && (
-        <FAB onPress={() => setImportVisible(true)} />
-      )}
+      {!selectionMode && <FAB onPress={() => setImportVisible(true)} />}
 
       {/* Import Modal */}
       <ImportModal
@@ -225,7 +373,7 @@ export default function VaultScreen() {
         onClose={() => setImportVisible(false)}
         onComplete={() => {
           setImportVisible(false);
-          refreshMedia(vaultType || 'real');
+          refreshMedia();
         }}
       />
 
@@ -237,6 +385,27 @@ export default function VaultScreen() {
         onClose={() => setViewerVisible(false)}
         onDelete={handleViewerDelete}
       />
+
+      {/* Importing Banner */}
+      {importing && (
+        <View style={styles.importingBanner}>
+          <View style={styles.importingContent}>
+            <ActivityIndicator size="small" color={colors.primary} />
+            <View style={styles.importingTextContainer}>
+              <Text style={styles.importingTitle}>
+                {importProgress < 80 ? 'Importing...' : 'Encrypting...'}
+              </Text>
+              <Text style={styles.importingSubtitle}>
+                Don't close the app
+              </Text>
+            </View>
+            <Text style={styles.importingProgress}>{Math.round(importProgress)}%</Text>
+          </View>
+          <View style={styles.progressBar}>
+            <View style={[styles.progressFill, { width: `${importProgress}%` }]} />
+          </View>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -251,6 +420,16 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: colors.background,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  loadingText: {
+    marginTop: spacing.md,
+    fontSize: 16,
+    color: colors.textSecondary,
   },
   header: {
     flexDirection: 'row',
@@ -269,9 +448,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: colors.textSecondary,
     marginTop: 2,
-  },
-  headerRight: {
-    width: 60,
   },
   headerButton: {
     paddingVertical: spacing.sm,
@@ -312,6 +488,33 @@ const styles = StyleSheet.create({
   },
   thumbnailSelected: {
     opacity: 0.7,
+  },
+  thumbnailPlaceholder: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: colors.surface,
+  },
+  filePlaceholder: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: colors.surfaceSecondary,
+  },
+  extensionBadge: {
+    marginTop: spacing.xs,
+    backgroundColor: colors.primary,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 4,
+  },
+  extensionText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: colors.text,
+    letterSpacing: 0.5,
   },
   durationBadge: {
     position: 'absolute',
@@ -369,5 +572,54 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: colors.textSecondary,
     textAlign: 'center',
+  },
+  importingBanner: {
+    position: 'absolute',
+    bottom: 100,
+    left: spacing.lg,
+    right: spacing.lg,
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  importingContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  importingTextContainer: {
+    flex: 1,
+    marginLeft: spacing.md,
+  },
+  importingTitle: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: colors.text,
+  },
+  importingSubtitle: {
+    fontSize: 12,
+    color: colors.textSecondary,
+    marginTop: 2,
+  },
+  importingProgress: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: colors.primary,
+  },
+  progressBar: {
+    height: 4,
+    backgroundColor: colors.surfaceSecondary,
+    borderRadius: 2,
+    marginTop: spacing.sm,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: colors.primary,
+    borderRadius: 2,
   },
 });

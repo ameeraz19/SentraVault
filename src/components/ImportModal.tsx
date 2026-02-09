@@ -16,6 +16,7 @@ import { Image } from 'expo-image';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as MediaLibrary from 'expo-media-library';
+import * as DocumentPicker from 'expo-document-picker';
 import * as Haptics from 'expo-haptics';
 import { useAuthStore } from '../store';
 import { useMediaStore } from '../store/mediaStore';
@@ -27,6 +28,8 @@ const COLUMN_COUNT = 3;
 const GAP = 2;
 const ITEM_SIZE = (SCREEN_WIDTH - GAP * (COLUMN_COUNT + 1)) / COLUMN_COUNT;
 const DISMISS_THRESHOLD = 120;
+
+type TabType = 'photos' | 'files';
 
 interface Asset {
   id: string;
@@ -44,9 +47,11 @@ interface ImportModalProps {
 
 export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) {
   const insets = useSafeAreaInsets();
-  const { vaultType } = useAuthStore();
-  const { importMedia, importing, importProgress } = useMediaStore();
+  const { getCredentials } = useAuthStore();
+  const { importFromPhotos, importFromFiles, importSvaultFile, importing, importProgress } =
+    useMediaStore();
 
+  const [activeTab, setActiveTab] = useState<TabType>('photos');
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -64,11 +69,17 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
         Animated.spring(translateY, { toValue: 0, useNativeDriver: true, damping: 20 }),
         Animated.timing(backdropOpacity, { toValue: 1, duration: 200, useNativeDriver: true }),
       ]).start();
-      requestPermission();
+      if (activeTab === 'photos') {
+        requestPermission();
+      }
     } else {
       translateY.setValue(SCREEN_HEIGHT);
       backdropOpacity.setValue(0);
       setSelected(new Set());
+      setAssets([]);
+      setEndCursor(undefined);
+      setHasMore(true);
+      setActiveTab('photos');
     }
   }, [visible]);
 
@@ -122,13 +133,21 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
         sortBy: [MediaLibrary.SortBy.creationTime],
       });
 
-      setAssets((prev) => [...prev, ...result.assets as Asset[]]);
+      setAssets((prev) => [...prev, ...(result.assets as Asset[])]);
       setEndCursor(result.endCursor);
       setHasMore(result.hasNextPage);
     } catch (error) {
       Alert.alert('Error', 'Failed to load photos');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleTabChange = async (tab: TabType) => {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setActiveTab(tab);
+    if (tab === 'photos' && hasPermission === null) {
+      requestPermission();
     }
   };
 
@@ -154,7 +173,7 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
     }
   };
 
-  const handleImport = async () => {
+  const handleImportPhotos = async () => {
     if (selected.size === 0) {
       Alert.alert('Select Items', 'Please select photos or videos to import');
       return;
@@ -162,17 +181,94 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
 
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
-    const selectedAssets = assets.filter((a) => selected.has(a.id));
+    try {
+      // Get selected assets
+      const selectedAssets: MediaLibrary.Asset[] = [];
+      for (const id of selected) {
+        const asset = await MediaLibrary.getAssetInfoAsync(id);
+        selectedAssets.push(asset);
+      }
+
+      const imported = await importFromPhotos(selectedAssets);
+
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Alert.alert('Import Complete', `${imported} item(s) added to vault`);
+      handleClose();
+      setTimeout(() => onComplete(), 300);
+    } catch (error) {
+      console.error('Import failed:', error);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert('Import Failed', 'Some files could not be imported.');
+    }
+  };
+
+  const handlePickFiles = async () => {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
     try {
-      await importMedia(selectedAssets, vaultType || 'real');
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      const result = await DocumentPicker.getDocumentAsync({
+        type: '*/*',
+        multiple: true,
+        copyToCacheDirectory: true,
+      });
 
-      handleClose();
-      setTimeout(() => {
-        onComplete();
-      }, 300);
+      if (result.canceled || !result.assets || result.assets.length === 0) {
+        return;
+      }
+
+      // Separate .svault files from regular files
+      const svaultFiles = result.assets.filter((f) => f.name?.endsWith('.svault'));
+      const regularFiles = result.assets.filter((f) => !f.name?.endsWith('.svault'));
+
+      let totalImported = 0;
+
+      // Import regular files
+      if (regularFiles.length > 0) {
+        const files = regularFiles.map((f) => ({
+          uri: f.uri,
+          name: f.name || 'file',
+          mimeType: f.mimeType || 'application/octet-stream',
+        }));
+        totalImported += await importFromFiles(files);
+      }
+
+      // Import .svault files
+      if (svaultFiles.length > 0) {
+        const credentials = getCredentials();
+        if (!credentials) {
+          Alert.alert('Error', 'Cannot import .svault files - not authenticated');
+          return;
+        }
+
+        for (const svaultFile of svaultFiles) {
+          try {
+            const imported = await importSvaultFile(
+              svaultFile.uri,
+              credentials.password,
+              credentials.secretKey
+            );
+            totalImported += imported;
+          } catch (error) {
+            console.error('Failed to import .svault file:', error);
+            Alert.alert(
+              'Import Error',
+              `Failed to import ${svaultFile.name}. Wrong password or corrupted file.`
+            );
+          }
+        }
+      }
+
+      if (totalImported > 0) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        Alert.alert('Import Complete', `${totalImported} item(s) added to vault`);
+        handleClose();
+        setTimeout(() => onComplete(), 300);
+      } else {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+        Alert.alert('No Items Imported', 'No valid files were imported');
+      }
     } catch (error) {
+      console.error('File picker failed:', error);
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       Alert.alert('Import Failed', 'Some files could not be imported.');
     }
@@ -204,15 +300,44 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
           </View>
         )}
         <View style={[styles.checkbox, isSelected && styles.checkboxSelected]}>
-          {isSelected && (
-            <Ionicons name="checkmark" size={14} color={colors.text} />
-          )}
+          {isSelected && <Ionicons name="checkmark" size={14} color={colors.text} />}
         </View>
       </TouchableOpacity>
     );
   };
 
-  const renderContent = () => {
+  const renderSegmentedControl = () => (
+    <View style={styles.segmentedControl}>
+      <TouchableOpacity
+        style={[styles.segment, activeTab === 'photos' && styles.segmentActive]}
+        onPress={() => handleTabChange('photos')}
+      >
+        <Ionicons
+          name="images"
+          size={18}
+          color={activeTab === 'photos' ? colors.text : colors.textSecondary}
+        />
+        <Text style={[styles.segmentText, activeTab === 'photos' && styles.segmentTextActive]}>
+          Photos
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.segment, activeTab === 'files' && styles.segmentActive]}
+        onPress={() => handleTabChange('files')}
+      >
+        <Ionicons
+          name="folder"
+          size={18}
+          color={activeTab === 'files' ? colors.text : colors.textSecondary}
+        />
+        <Text style={[styles.segmentText, activeTab === 'files' && styles.segmentTextActive]}>
+          Files
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+
+  const renderPhotosTab = () => {
     if (hasPermission === null) {
       return (
         <View style={styles.center}>
@@ -274,8 +399,12 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
         {selected.size > 0 && (
           <View style={[styles.footer, { paddingBottom: insets.bottom + spacing.md }]}>
             <Button
-              title={importing ? 'Importing...' : `Import ${selected.size} ${selected.size === 1 ? 'item' : 'items'}`}
-              onPress={handleImport}
+              title={
+                importing
+                  ? 'Importing...'
+                  : `Import ${selected.size} ${selected.size === 1 ? 'item' : 'items'}`
+              }
+              onPress={handleImportPhotos}
               disabled={importing}
               loading={importing}
             />
@@ -284,6 +413,42 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
       </>
     );
   };
+
+  const renderFilesTab = () => (
+    <View style={styles.filesContainer}>
+      {importing ? (
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={styles.importingText}>Importing files...</Text>
+          <View style={styles.progressBarLarge}>
+            <View style={[styles.progressFill, { width: `${importProgress}%` }]} />
+          </View>
+        </View>
+      ) : (
+        <>
+          <View style={styles.filesIconContainer}>
+            <Ionicons name="folder-open" size={48} color={colors.textTertiary} />
+          </View>
+          <Text style={styles.filesTitle}>Import from Files</Text>
+          <Text style={styles.filesDescription}>
+            Select photos, videos, documents, or .svault backup files
+          </Text>
+          <Button
+            title="Choose Files"
+            onPress={handlePickFiles}
+            icon={<Ionicons name="document-attach" size={20} color={colors.text} />}
+          />
+
+          <View style={styles.supportedFormats}>
+            <Text style={styles.supportedTitle}>Supported formats:</Text>
+            <Text style={styles.supportedText}>
+              Images, Videos, PDFs, Documents, .svault backups, and any other file
+            </Text>
+          </View>
+        </>
+      )}
+    </View>
+  );
 
   if (!visible) return null;
 
@@ -294,10 +459,7 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
       </Animated.View>
 
       <Animated.View
-        style={[
-          styles.container,
-          { paddingTop: insets.top, transform: [{ translateY }] }
-        ]}
+        style={[styles.container, { paddingTop: insets.top, transform: [{ translateY }] }]}
         {...panResponder.panHandlers}
       >
         <View style={styles.handleContainer}>
@@ -306,7 +468,7 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
 
         <View style={styles.header}>
           <Text style={styles.title}>Import</Text>
-          {assets.length > 0 && (
+          {activeTab === 'photos' && assets.length > 0 && (
             <TouchableOpacity onPress={selectAll} style={styles.selectAllButton}>
               <Text style={styles.selectAllText}>
                 {selected.size === assets.length ? 'Clear' : 'All'}
@@ -315,7 +477,9 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
           )}
         </View>
 
-        {renderContent()}
+        {renderSegmentedControl()}
+
+        {activeTab === 'photos' ? renderPhotosTab() : renderFilesTab()}
       </Animated.View>
     </Modal>
   );
@@ -373,6 +537,36 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontWeight: '500',
   },
+  // Segmented Control
+  segmentedControl: {
+    flexDirection: 'row',
+    marginHorizontal: spacing.lg,
+    marginBottom: spacing.md,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    padding: 4,
+  },
+  segment: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: spacing.sm,
+    borderRadius: radius.sm,
+    gap: spacing.xs,
+  },
+  segmentActive: {
+    backgroundColor: colors.primary,
+  },
+  segmentText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: colors.textSecondary,
+  },
+  segmentTextActive: {
+    color: colors.text,
+  },
+  // Progress
   progressContainer: {
     paddingHorizontal: spacing.lg,
     paddingBottom: spacing.sm,
@@ -383,10 +577,19 @@ const styles = StyleSheet.create({
     borderRadius: 1,
     overflow: 'hidden',
   },
+  progressBarLarge: {
+    height: 4,
+    backgroundColor: colors.border,
+    borderRadius: 2,
+    overflow: 'hidden',
+    width: '80%',
+    marginTop: spacing.md,
+  },
   progressFill: {
     height: '100%',
     backgroundColor: colors.primary,
   },
+  // Photos Grid
   grid: {
     padding: GAP,
   },
@@ -453,6 +656,7 @@ const styles = StyleSheet.create({
     borderTopWidth: 0.5,
     borderTopColor: colors.border,
   },
+  // Permission
   permissionIconContainer: {
     width: 72,
     height: 72,
@@ -471,5 +675,55 @@ const styles = StyleSheet.create({
     color: colors.textSecondary,
     textAlign: 'center',
     marginBottom: spacing.sm,
+  },
+  // Files Tab
+  filesContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: spacing.xl,
+    gap: spacing.lg,
+  },
+  filesIconContainer: {
+    width: 96,
+    height: 96,
+    borderRadius: 48,
+    backgroundColor: colors.surface,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  filesTitle: {
+    fontSize: 22,
+    fontWeight: '600',
+    color: colors.text,
+  },
+  filesDescription: {
+    fontSize: 15,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    marginBottom: spacing.sm,
+  },
+  importingText: {
+    fontSize: 16,
+    color: colors.text,
+    marginTop: spacing.md,
+  },
+  supportedFormats: {
+    marginTop: spacing.xl,
+    padding: spacing.lg,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    width: '100%',
+  },
+  supportedTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    marginBottom: spacing.xs,
+  },
+  supportedText: {
+    fontSize: 13,
+    color: colors.textTertiary,
+    lineHeight: 18,
   },
 });

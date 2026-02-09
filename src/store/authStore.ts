@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import * as SecureStore from 'expo-secure-store';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as Crypto from 'expo-crypto';
+import { initializeCrypto, getSecretKey } from '../utils/encryption';
+import { useMediaStore } from './mediaStore';
 
 type AuthState = 'loading' | 'setup' | 'biometrics' | 'password' | 'unlocked';
 type VaultType = 'real' | 'decoy' | null;
@@ -11,13 +13,16 @@ interface AuthStore {
   vaultType: VaultType;
   error: string | null;
   biometricsAvailable: boolean;
+  password: string | null; // Stored temporarily for container operations
+  secretKey: string | null; // Secret key from secure storage
 
   initialize: () => Promise<void>;
   setupVault: (realPassword: string, decoyPassword: string) => Promise<boolean>;
   authenticateBiometrics: () => Promise<boolean>;
   authenticatePassword: (password: string) => Promise<boolean>;
-  lock: () => void;
+  lock: () => Promise<void>;
   clearError: () => void;
+  getCredentials: () => { password: string; secretKey: string } | null;
 }
 
 const hashPassword = async (password: string, salt: string): Promise<string> => {
@@ -31,6 +36,8 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   vaultType: null,
   error: null,
   biometricsAvailable: false,
+  password: null,
+  secretKey: null,
 
   initialize: async () => {
     try {
@@ -38,14 +45,20 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       const isEnrolled = await LocalAuthentication.isEnrolledAsync();
       const biometricsAvailable = hasHardware && isEnrolled;
 
-      const setupComplete = await SecureStore.getItemAsync('setup_complete');
+      const setupComplete = await SecureStore.getItemAsync('sv2_setup_complete');
+
+      // Initialize crypto random number generator
+      await initializeCrypto();
+
+      // Pre-initialize the secret key (generates if not exists)
+      const secretKey = await getSecretKey();
 
       if (!setupComplete) {
-        set({ authState: 'setup', biometricsAvailable });
+        set({ authState: 'setup', biometricsAvailable, secretKey });
       } else if (biometricsAvailable) {
-        set({ authState: 'biometrics', biometricsAvailable });
+        set({ authState: 'biometrics', biometricsAvailable, secretKey });
       } else {
-        set({ authState: 'password', biometricsAvailable });
+        set({ authState: 'password', biometricsAvailable, secretKey });
       }
     } catch {
       set({ authState: 'setup', error: 'Failed to initialize' });
@@ -62,15 +75,19 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       const realHash = await hashPassword(realPassword, salt);
       const decoyHash = await hashPassword(decoyPassword, salt);
 
-      await SecureStore.setItemAsync('salt', salt);
-      await SecureStore.setItemAsync('real_hash', realHash);
-      await SecureStore.setItemAsync('decoy_hash', decoyHash);
-      await SecureStore.setItemAsync('setup_complete', 'true');
+      await SecureStore.setItemAsync('sv2_salt', salt);
+      await SecureStore.setItemAsync('sv2_real_hash', realHash);
+      await SecureStore.setItemAsync('sv2_decoy_hash', decoyHash);
+      await SecureStore.setItemAsync('sv2_setup_complete', 'true');
+
+      // Ensure secret key is generated and stored
+      const secretKey = await getSecretKey();
 
       const { biometricsAvailable } = get();
       set({
         authState: biometricsAvailable ? 'biometrics' : 'password',
-        error: null
+        secretKey,
+        error: null,
       });
       return true;
     } catch {
@@ -99,9 +116,9 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
   authenticatePassword: async (password) => {
     try {
-      const salt = await SecureStore.getItemAsync('salt');
-      const realHash = await SecureStore.getItemAsync('real_hash');
-      const decoyHash = await SecureStore.getItemAsync('decoy_hash');
+      const salt = await SecureStore.getItemAsync('sv2_salt');
+      const realHash = await SecureStore.getItemAsync('sv2_real_hash');
+      const decoyHash = await SecureStore.getItemAsync('sv2_decoy_hash');
 
       if (!salt || !realHash || !decoyHash) {
         set({ error: 'Vault not configured' });
@@ -109,31 +126,65 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       }
 
       const enteredHash = await hashPassword(password, salt);
+      const secretKey = await getSecretKey();
+
+      let vaultType: VaultType = null;
 
       if (enteredHash === realHash) {
-        set({ authState: 'unlocked', vaultType: 'real', error: null });
-        return true;
+        vaultType = 'real';
       } else if (enteredHash === decoyHash) {
-        set({ authState: 'unlocked', vaultType: 'decoy', error: null });
-        return true;
+        vaultType = 'decoy';
       } else {
         set({ error: 'Incorrect password' });
         return false;
       }
-    } catch {
+
+      // Open the vault container
+      const mediaStore = useMediaStore.getState();
+      const opened = await mediaStore.openVault(password, secretKey, vaultType);
+
+      if (!opened) {
+        set({ error: 'Failed to open vault' });
+        return false;
+      }
+
+      set({
+        authState: 'unlocked',
+        vaultType,
+        password, // Store temporarily for export operations
+        secretKey,
+        error: null,
+      });
+
+      return true;
+    } catch (error) {
+      console.error('Authentication error:', error);
       set({ error: 'Authentication failed' });
       return false;
     }
   },
 
-  lock: () => {
+  lock: async () => {
+    // Close the vault container and clean up temp files
+    const mediaStore = useMediaStore.getState();
+    await mediaStore.closeVault();
+
     const { biometricsAvailable } = get();
     set({
       authState: biometricsAvailable ? 'biometrics' : 'password',
       vaultType: null,
-      error: null
+      password: null, // Clear password from memory
+      error: null,
     });
   },
 
   clearError: () => set({ error: null }),
+
+  getCredentials: () => {
+    const { password, secretKey } = get();
+    if (password && secretKey) {
+      return { password, secretKey };
+    }
+    return null;
+  },
 }));

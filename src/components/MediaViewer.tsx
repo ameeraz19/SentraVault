@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -10,22 +10,16 @@ import {
   TouchableOpacity,
   Animated,
   PanResponder,
+  ActivityIndicator,
 } from 'react-native';
 import { Image } from 'expo-image';
 import { Video, ResizeMode } from 'expo-av';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing } from '../theme';
+import { useMediaStore, MediaItem } from '../store/mediaStore';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 const DISMISS_THRESHOLD = 120;
-
-interface MediaItem {
-  id: string;
-  type: 'photo' | 'video';
-  encryptedPath: string;
-  originalName: string;
-  duration?: number;
-}
 
 interface MediaViewerProps {
   visible: boolean;
@@ -45,7 +39,10 @@ export function MediaViewer({
   const insets = useSafeAreaInsets();
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const [headerVisible, setHeaderVisible] = useState(true);
+  const [decryptedUris, setDecryptedUris] = useState<Map<string, string>>(new Map());
+  const [loadingIds, setLoadingIds] = useState<Set<string>>(new Set());
   const flatListRef = useRef<FlatList>(null);
+  const getFilePath = useMediaStore((s) => s.getFilePath);
 
   // Animation values
   const translateY = useRef(new Animated.Value(0)).current;
@@ -57,6 +54,65 @@ export function MediaViewer({
     scale.setValue(1);
     opacity.setValue(1);
   };
+
+  // Reset state when modal opens
+  useEffect(() => {
+    if (visible) {
+      setCurrentIndex(initialIndex);
+      setDecryptedUris(new Map());
+      setLoadingIds(new Set());
+      resetAnimations();
+    }
+  }, [visible, initialIndex]);
+
+  // Extract media items from container as needed
+  const extractMediaItem = useCallback(async (item: MediaItem) => {
+    // Skip if already extracted or loading
+    if (decryptedUris.has(item.id) || loadingIds.has(item.id)) {
+      return;
+    }
+
+    // Mark as loading
+    setLoadingIds(prev => new Set(prev).add(item.id));
+
+    try {
+      const extractedPath = await getFilePath(item.id);
+      if (extractedPath) {
+        setDecryptedUris(prev => {
+          const newMap = new Map(prev);
+          newMap.set(item.id, extractedPath);
+          return newMap;
+        });
+      }
+    } catch (error) {
+      console.error('Failed to extract media:', error);
+    } finally {
+      setLoadingIds(prev => {
+        const newSet = new Set(prev);
+        newSet.delete(item.id);
+        return newSet;
+      });
+    }
+  }, [decryptedUris, loadingIds, getFilePath]);
+
+  // Extract current and adjacent items from container
+  useEffect(() => {
+    if (!visible || media.length === 0) return;
+
+    // Extract current item
+    const current = media[currentIndex];
+    if (current) extractMediaItem(current);
+
+    // Pre-extract adjacent items
+    if (currentIndex > 0) {
+      const prev = media[currentIndex - 1];
+      if (prev) extractMediaItem(prev);
+    }
+    if (currentIndex < media.length - 1) {
+      const next = media[currentIndex + 1];
+      if (next) extractMediaItem(next);
+    }
+  }, [visible, currentIndex, media, extractMediaItem]);
 
   const handleClose = useCallback(() => {
     resetAnimations();
@@ -109,12 +165,29 @@ export function MediaViewer({
   const imagePanResponder = useRef(createImagePanResponder()).current;
 
   const renderItem = useCallback(({ item }: { item: MediaItem }) => {
-    if (item.type === 'video') {
+    const extractedUri = decryptedUris.get(item.id);
+    const isLoading = loadingIds.has(item.id);
+
+    // Show loading indicator while extracting
+    if (isLoading || !extractedUri) {
+      return (
+        <View style={styles.mediaContainer}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={styles.loadingText}>Loading...</Text>
+        </View>
+      );
+    }
+
+    const uri = extractedUri;
+
+    const isVideo = item.type === 'video' || item.mimeType?.startsWith('video/');
+
+    if (isVideo) {
       // Video - no pan responder, let native controls work
       return (
         <View style={styles.mediaContainer}>
           <Video
-            source={{ uri: item.encryptedPath }}
+            source={{ uri }}
             style={styles.media}
             useNativeControls
             resizeMode={ResizeMode.CONTAIN}
@@ -151,14 +224,14 @@ export function MediaViewer({
           style={styles.imageWrapper}
         >
           <Image
-            source={{ uri: item.encryptedPath }}
+            source={{ uri }}
             style={styles.media}
             contentFit="contain"
           />
         </TouchableOpacity>
       </Animated.View>
     );
-  }, [handleClose, insets.top]);
+  }, [handleClose, insets.top, decryptedUris, loadingIds]);
 
   const getItemLayout = useCallback((_: any, index: number) => ({
     length: SCREEN_WIDTH,
@@ -171,7 +244,7 @@ export function MediaViewer({
   }
 
   const currentMedia = media[currentIndex];
-  const isVideo = currentMedia?.type === 'video';
+  const isVideo = currentMedia?.type === 'video' || currentMedia?.mimeType?.startsWith('video/');
 
   return (
     <Modal
@@ -316,5 +389,10 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontSize: 16,
     fontWeight: '600',
+  },
+  loadingText: {
+    color: colors.textSecondary,
+    fontSize: 14,
+    marginTop: spacing.md,
   },
 });

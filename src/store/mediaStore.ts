@@ -1,704 +1,427 @@
 import { create } from 'zustand';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
-import * as Crypto from 'expo-crypto';
+import {
+  ContainerHandle,
+  VaultItem,
+  openContainer,
+  saveContainer,
+  addFileToContainer,
+  extractThumbnail,
+  extractThumbnails,
+  extractFile,
+  deleteFromContainer,
+  cleanupTempFiles,
+  getContainerPath,
+  exportSelection,
+  importFromSvault,
+  containerExists,
+} from '../utils/containerFormat';
+import { useAuthStore } from './authStore';
 
 type VaultType = 'real' | 'decoy';
 
-interface MediaItem {
-  id: string;
-  type: 'photo' | 'video';
-  thumbnailUri: string | null;
-  encryptedPath: string;
-  originalName: string;
-  size: number;
-  duration?: number;
-  createdAt: number;
-  checksum: string;
-}
-
-// Single item export format
-interface VaultExportItem {
-  type: 'photo' | 'video';
-  originalName: string;
-  duration?: number;
-  createdAt: number;
-  checksum: string;
-  data: string; // Base64 encoded file data
-}
-
-// Export bundle format - can contain multiple items
-interface VaultExportBundle {
-  version: number;
-  exportedAt: number;
-  itemCount: number;
-  items: VaultExportItem[];
-}
-
-// Temporary preview item (for viewing .svault without importing)
-interface PreviewItem {
-  id: string;
-  type: 'photo' | 'video';
-  uri: string;
-  originalName: string;
-  duration?: number;
-}
+// Re-export VaultItem as MediaItem for compatibility
+export type MediaItem = VaultItem;
 
 interface MediaStore {
+  // Container state
+  containerHandle: ContainerHandle | null;
+  isContainerOpen: boolean;
+
+  // Media state
   media: MediaItem[];
+  thumbnailCache: Map<string, string>; // id -> temp file path
+  extractedFiles: Map<string, string>; // id -> temp file path
+
+  // UI state
   loading: boolean;
   importing: boolean;
   importProgress: number;
 
-  loadMedia: (vaultType: VaultType) => Promise<void>;
-  refreshMedia: (vaultType: VaultType) => Promise<void>;
-  importMedia: (assets: any[], vaultType: VaultType) => Promise<void>;
-  importFromUSB: (files: any[], vaultType: VaultType) => Promise<void>;
-  importVaultFiles: (files: any[], vaultType: VaultType) => Promise<void>;
-  exportToUSB: (mediaIds: string[], vaultType: VaultType) => Promise<void>;
-  exportAllToUSB: (vaultType: VaultType) => Promise<void>;
-  deleteMedia: (id: string) => Promise<void>;
-  previewVaultFile: (fileUri: string) => Promise<PreviewItem[]>;
-  cleanupPreviews: () => Promise<void>;
+  // Operations
+  openVault: (password: string, secretKey: string, vaultType: VaultType) => Promise<boolean>;
+  closeVault: () => Promise<void>;
+
+  loadThumbnails: (startIndex: number, count: number) => Promise<void>;
+  getThumbnailPath: (itemId: string) => Promise<string | null>;
+  getFilePath: (itemId: string) => Promise<string | null>;
+
+  importFromPhotos: (assets: MediaLibrary.Asset[]) => Promise<number>;
+  importFromFiles: (files: { uri: string; name: string; mimeType: string }[]) => Promise<number>;
+  importSvaultFile: (svaultUri: string, password: string, secretKey: string) => Promise<number>;
+
+  deleteMedia: (ids: string[]) => Promise<void>;
+  exportVault: () => Promise<string>;
+  exportSelection: (ids: string[], password: string, secretKey: string) => Promise<string>;
+
+  // Legacy compatibility
+  refreshMedia: () => Promise<void>;
 }
 
-const VAULT_DIR = FileSystem.documentDirectory + 'vault/';
-const DECOY_VAULT_DIR = FileSystem.documentDirectory + 'decoy_vault/';
-const EXPORT_DIR = FileSystem.cacheDirectory + 'export/';
-
-const ensureVaultDir = async (vaultType: VaultType) => {
-  const dir = vaultType === 'real' ? VAULT_DIR : DECOY_VAULT_DIR;
-  const dirInfo = await FileSystem.getInfoAsync(dir);
-  if (!dirInfo.exists) {
-    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-  }
-  return dir;
-};
-
-const ensureExportDir = async () => {
-  const dirInfo = await FileSystem.getInfoAsync(EXPORT_DIR);
-  if (!dirInfo.exists) {
-    await FileSystem.makeDirectoryAsync(EXPORT_DIR, { intermediates: true });
-  }
-  return EXPORT_DIR;
-};
-
-const generateId = (): string => {
-  return Math.random().toString(36).substring(2, 15) +
-    Math.random().toString(36).substring(2, 15);
-};
-
-// Get file extension from original name or type
-const getExtension = (type: 'photo' | 'video', originalName?: string): string => {
-  if (originalName) {
-    const ext = originalName.split('.').pop()?.toLowerCase();
-    if (ext && ['jpg', 'jpeg', 'png', 'gif', 'heic', 'mp4', 'mov', 'm4v', 'webm'].includes(ext)) {
-      return ext;
+/**
+ * Generate a thumbnail from an image or video
+ * Note: For now, we use the original image for photos (thumbnails stored in container)
+ * Video thumbnails require expo-video-thumbnails which may need separate handling
+ */
+async function generateThumbnail(
+  uri: string,
+  mimeType: string
+): Promise<string | null> {
+  try {
+    if (mimeType.startsWith('image/')) {
+      // For images, read the full file as base64 (will be used as thumbnail in container)
+      // In a production app, you'd want to resize this first using expo-image-manipulator
+      const base64 = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      return base64;
+    } else if (mimeType.startsWith('video/')) {
+      // For videos, we can't easily generate thumbnails without additional libraries
+      // Return null for now - videos will show a placeholder
+      return null;
     }
+    return null;
+  } catch (error) {
+    console.error('Failed to generate thumbnail:', error);
+    return null;
   }
-  return type === 'video' ? 'mp4' : 'jpg';
-};
+}
 
 export const useMediaStore = create<MediaStore>((set, get) => ({
+  containerHandle: null,
+  isContainerOpen: false,
   media: [],
+  thumbnailCache: new Map(),
+  extractedFiles: new Map(),
   loading: false,
   importing: false,
   importProgress: 0,
 
-  loadMedia: async (vaultType) => {
+  openVault: async (password, secretKey, vaultType) => {
     set({ loading: true });
     try {
-      const dir = await ensureVaultDir(vaultType);
-      const metadataPath = dir + 'metadata.json';
-      const metaInfo = await FileSystem.getInfoAsync(metadataPath);
-
-      if (metaInfo.exists) {
-        const content = await FileSystem.readAsStringAsync(metadataPath);
-        const media = JSON.parse(content) as MediaItem[];
-        set({ media, loading: false });
-      } else {
-        set({ media: [], loading: false });
-      }
-    } catch (error) {
-      console.error('Failed to load media:', error);
-      set({ media: [], loading: false });
-    }
-  },
-
-  refreshMedia: async (vaultType) => {
-    await get().loadMedia(vaultType);
-  },
-
-  importMedia: async (assets, vaultType) => {
-    set({ importing: true, importProgress: 0 });
-
-    try {
-      const dir = await ensureVaultDir(vaultType);
-      const metadataPath = dir + 'metadata.json';
-      const { media } = get();
-      const newMedia: MediaItem[] = [...media];
-
-      for (let i = 0; i < assets.length; i++) {
-        const asset = assets[i];
-        const progress = ((i + 1) / assets.length) * 100;
-        set({ importProgress: progress });
-
-        const id = generateId();
-
-        // Get the full asset info with localUri
-        const assetInfo = await MediaLibrary.getAssetInfoAsync(asset.id);
-        const sourceUri = assetInfo.localUri || asset.uri;
-
-        if (!sourceUri) {
-          console.error('No source URI for asset:', asset.id);
-          continue;
-        }
-
-        // First copy to cache directory
-        const tempPath = FileSystem.cacheDirectory + id + '_temp';
-
-        try {
-          await FileSystem.copyAsync({
-            from: sourceUri,
-            to: tempPath,
-          });
-        } catch (copyError) {
-          console.error('Failed to copy from sourceUri, trying asset.uri:', copyError);
-          try {
-            await FileSystem.copyAsync({
-              from: asset.uri,
-              to: tempPath,
-            });
-          } catch (fallbackError) {
-            console.error('Failed to copy asset:', fallbackError);
-            continue;
-          }
-        }
-
-        const tempInfo = await FileSystem.getInfoAsync(tempPath);
-        if (!tempInfo.exists) {
-          console.error('Temp file does not exist after copy');
-          continue;
-        }
-
-        let checksum = '';
-        try {
-          const fileContent = await FileSystem.readAsStringAsync(tempPath, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          checksum = await Crypto.digestStringAsync(
-            Crypto.CryptoDigestAlgorithm.SHA256,
-            fileContent.substring(0, 10000)
-          );
-        } catch (hashError) {
-          console.error('Failed to hash file, using timestamp:', hashError);
-          checksum = Date.now().toString();
-        }
-
-        // Store with original extension for proper playback
-        const ext = getExtension(asset.mediaType === 'video' ? 'video' : 'photo', asset.filename);
-        const encryptedPath = dir + id + '.' + ext;
-
-        await FileSystem.moveAsync({
-          from: tempPath,
-          to: encryptedPath,
-        });
-
-        const verifyInfo = await FileSystem.getInfoAsync(encryptedPath);
-        if (!verifyInfo.exists) {
-          console.error('Failed to move file to vault');
-          continue;
-        }
-
-        const mediaItem: MediaItem = {
-          id,
-          type: asset.mediaType === 'video' ? 'video' : 'photo',
-          thumbnailUri: null,
-          encryptedPath,
-          originalName: asset.filename || `media_${id}.${ext}`,
-          size: tempInfo.size || 0,
-          duration: asset.duration,
-          createdAt: Date.now(),
-          checksum,
-        };
-
-        newMedia.push(mediaItem);
+      const handle = await openContainer(vaultType, password, secretKey);
+      if (!handle) {
+        set({ loading: false });
+        return false;
       }
 
-      await FileSystem.writeAsStringAsync(
-        metadataPath,
-        JSON.stringify(newMedia)
-      );
-
-      set({ media: newMedia, importing: false, importProgress: 100 });
-    } catch (error) {
-      console.error('Failed to import media:', error);
-      set({ importing: false, importProgress: 0 });
-      throw error;
-    }
-  },
-
-  importFromUSB: async (files, vaultType) => {
-    set({ importing: true, importProgress: 0 });
-
-    try {
-      const dir = await ensureVaultDir(vaultType);
-      const metadataPath = dir + 'metadata.json';
-      const { media } = get();
-      const newMedia: MediaItem[] = [...media];
-
-      // Separate .svault files from regular media
-      const vaultFiles = files.filter((f: any) =>
-        f.name?.endsWith('.svault') || f.mimeType === 'application/octet-stream'
-      );
-      const regularFiles = files.filter((f: any) =>
-        !f.name?.endsWith('.svault') && f.mimeType !== 'application/octet-stream'
-      );
-
-      // Import regular media files
-      for (let i = 0; i < regularFiles.length; i++) {
-        const file = regularFiles[i];
-        const progress = ((i + 1) / files.length) * 100;
-        set({ importProgress: progress });
-
-        const id = generateId();
-
-        let checksum = '';
-        try {
-          const fileContent = await FileSystem.readAsStringAsync(file.uri, {
-            encoding: FileSystem.EncodingType.Base64,
-          });
-          checksum = await Crypto.digestStringAsync(
-            Crypto.CryptoDigestAlgorithm.SHA256,
-            fileContent.substring(0, 10000)
-          );
-        } catch (hashError) {
-          console.error('Failed to hash USB file:', hashError);
-          checksum = Date.now().toString();
-        }
-
-        const isVideo = file.mimeType?.startsWith('video/');
-        const ext = getExtension(isVideo ? 'video' : 'photo', file.name);
-        const encryptedPath = dir + id + '.' + ext;
-
-        await FileSystem.copyAsync({
-          from: file.uri,
-          to: encryptedPath,
-        });
-
-        const verifyInfo = await FileSystem.getInfoAsync(encryptedPath);
-        if (!verifyInfo.exists) {
-          console.error('Failed to copy USB file to vault');
-          continue;
-        }
-
-        const mediaItem: MediaItem = {
-          id,
-          type: isVideo ? 'video' : 'photo',
-          thumbnailUri: null,
-          encryptedPath,
-          originalName: file.name || `usb_${id}.${ext}`,
-          size: file.size || verifyInfo.size || 0,
-          createdAt: Date.now(),
-          checksum,
-        };
-
-        newMedia.push(mediaItem);
-      }
-
-      // Import .svault bundle files (supports both single and multi-item bundles)
-      for (let i = 0; i < vaultFiles.length; i++) {
-        const file = vaultFiles[i];
-
-        try {
-          const bundleContent = await FileSystem.readAsStringAsync(file.uri);
-          const bundle: VaultExportBundle = JSON.parse(bundleContent);
-
-          if (bundle.version !== 1 && bundle.version !== 2) {
-            console.error('Unsupported vault bundle version:', bundle.version);
-            continue;
-          }
-
-          // Handle new multi-item format (version 2)
-          if (bundle.items && Array.isArray(bundle.items)) {
-            for (let j = 0; j < bundle.items.length; j++) {
-              const item = bundle.items[j];
-              const progress = ((regularFiles.length + i + (j / bundle.items.length)) / files.length) * 100;
-              set({ importProgress: progress });
-
-              const id = generateId();
-              const ext = getExtension(item.type, item.originalName);
-              const encryptedPath = dir + id + '.' + ext;
-
-              await FileSystem.writeAsStringAsync(
-                encryptedPath,
-                item.data,
-                { encoding: FileSystem.EncodingType.Base64 }
-              );
-
-              const verifyInfo = await FileSystem.getInfoAsync(encryptedPath);
-              if (!verifyInfo.exists) continue;
-
-              const mediaItem: MediaItem = {
-                id,
-                type: item.type,
-                thumbnailUri: null,
-                encryptedPath,
-                originalName: item.originalName,
-                size: verifyInfo.size || 0,
-                duration: item.duration,
-                createdAt: item.createdAt || Date.now(),
-                checksum: item.checksum,
-              };
-
-              newMedia.push(mediaItem);
-            }
-          } else {
-            // Handle legacy single-item format (version 1)
-            const progress = ((regularFiles.length + i + 1) / files.length) * 100;
-            set({ importProgress: progress });
-
-            const legacyBundle = bundle as any;
-            const id = generateId();
-            const ext = getExtension(legacyBundle.type, legacyBundle.originalName);
-            const encryptedPath = dir + id + '.' + ext;
-
-            await FileSystem.writeAsStringAsync(
-              encryptedPath,
-              legacyBundle.data,
-              { encoding: FileSystem.EncodingType.Base64 }
-            );
-
-            const verifyInfo = await FileSystem.getInfoAsync(encryptedPath);
-            if (!verifyInfo.exists) continue;
-
-            const mediaItem: MediaItem = {
-              id,
-              type: legacyBundle.type,
-              thumbnailUri: null,
-              encryptedPath,
-              originalName: legacyBundle.originalName,
-              size: verifyInfo.size || 0,
-              duration: legacyBundle.duration,
-              createdAt: legacyBundle.createdAt || Date.now(),
-              checksum: legacyBundle.checksum,
-            };
-
-            newMedia.push(mediaItem);
-          }
-        } catch (bundleError) {
-          console.error('Failed to parse vault bundle:', bundleError);
-          continue;
-        }
-      }
-
-      await FileSystem.writeAsStringAsync(
-        metadataPath,
-        JSON.stringify(newMedia)
-      );
-
-      set({ media: newMedia, importing: false, importProgress: 100 });
-    } catch (error) {
-      console.error('Failed to import from USB:', error);
-      set({ importing: false, importProgress: 0 });
-      throw error;
-    }
-  },
-
-  // Import .svault files specifically (supports both single and multi-item bundles)
-  importVaultFiles: async (files, vaultType) => {
-    set({ importing: true, importProgress: 0 });
-
-    try {
-      const dir = await ensureVaultDir(vaultType);
-      const metadataPath = dir + 'metadata.json';
-      const { media } = get();
-      const newMedia: MediaItem[] = [...media];
-
-      let totalItems = 0;
-      let processedItems = 0;
-
-      // First pass: count total items
-      for (const file of files) {
-        try {
-          const bundleContent = await FileSystem.readAsStringAsync(file.uri);
-          const bundle: VaultExportBundle = JSON.parse(bundleContent);
-          totalItems += bundle.items?.length || 1;
-        } catch {
-          totalItems += 1;
-        }
-      }
-
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-
-        try {
-          const bundleContent = await FileSystem.readAsStringAsync(file.uri);
-          const bundle: VaultExportBundle = JSON.parse(bundleContent);
-
-          if (bundle.version !== 1 && bundle.version !== 2) {
-            console.error('Unsupported vault bundle version');
-            continue;
-          }
-
-          // Handle new multi-item format (version 2)
-          if (bundle.items && Array.isArray(bundle.items)) {
-            for (const item of bundle.items) {
-              processedItems++;
-              set({ importProgress: (processedItems / totalItems) * 100 });
-
-              const id = generateId();
-              const ext = getExtension(item.type, item.originalName);
-              const encryptedPath = dir + id + '.' + ext;
-
-              await FileSystem.writeAsStringAsync(
-                encryptedPath,
-                item.data,
-                { encoding: FileSystem.EncodingType.Base64 }
-              );
-
-              const verifyInfo = await FileSystem.getInfoAsync(encryptedPath);
-              if (!verifyInfo.exists) continue;
-
-              const mediaItem: MediaItem = {
-                id,
-                type: item.type,
-                thumbnailUri: null,
-                encryptedPath,
-                originalName: item.originalName,
-                size: verifyInfo.size || 0,
-                duration: item.duration,
-                createdAt: item.createdAt || Date.now(),
-                checksum: item.checksum,
-              };
-
-              newMedia.push(mediaItem);
-            }
-          } else {
-            // Handle legacy single-item format (version 1)
-            processedItems++;
-            set({ importProgress: (processedItems / totalItems) * 100 });
-
-            const legacyBundle = bundle as any;
-            const id = generateId();
-            const ext = getExtension(legacyBundle.type, legacyBundle.originalName);
-            const encryptedPath = dir + id + '.' + ext;
-
-            await FileSystem.writeAsStringAsync(
-              encryptedPath,
-              legacyBundle.data,
-              { encoding: FileSystem.EncodingType.Base64 }
-            );
-
-            const verifyInfo = await FileSystem.getInfoAsync(encryptedPath);
-            if (!verifyInfo.exists) continue;
-
-            const mediaItem: MediaItem = {
-              id,
-              type: legacyBundle.type,
-              thumbnailUri: null,
-              encryptedPath,
-              originalName: legacyBundle.originalName,
-              size: verifyInfo.size || 0,
-              duration: legacyBundle.duration,
-              createdAt: legacyBundle.createdAt || Date.now(),
-              checksum: legacyBundle.checksum,
-            };
-
-            newMedia.push(mediaItem);
-          }
-        } catch (bundleError) {
-          console.error('Failed to parse vault bundle:', bundleError);
-        }
-      }
-
-      await FileSystem.writeAsStringAsync(
-        metadataPath,
-        JSON.stringify(newMedia)
-      );
-
-      set({ media: newMedia, importing: false, importProgress: 100 });
-    } catch (error) {
-      console.error('Failed to import vault files:', error);
-      set({ importing: false, importProgress: 0 });
-      throw error;
-    }
-  },
-
-  // Export specific media items (always bundles into single file)
-  exportToUSB: async (mediaIds, vaultType) => {
-    const { media } = get();
-    const itemsToExport = media.filter(m => mediaIds.includes(m.id));
-
-    if (itemsToExport.length === 0) {
-      throw new Error('No media to export');
-    }
-
-    const { shareAsync } = await import('expo-sharing');
-    const exportDir = await ensureExportDir();
-
-    try {
-      // Build array of export items
-      const exportItems: VaultExportItem[] = [];
-
-      for (const item of itemsToExport) {
-        const fileData = await FileSystem.readAsStringAsync(item.encryptedPath, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
-
-        exportItems.push({
-          type: item.type,
-          originalName: item.originalName,
-          duration: item.duration,
-          createdAt: item.createdAt,
-          checksum: item.checksum,
-          data: fileData,
-        });
-      }
-
-      // Create single bundle with all items
-      const bundle: VaultExportBundle = {
-        version: 2,
-        exportedAt: Date.now(),
-        itemCount: exportItems.length,
-        items: exportItems,
-      };
-
-      // Generate export filename
-      const timestamp = new Date().toISOString().slice(0, 10);
-      const exportName = itemsToExport.length === 1
-        ? itemsToExport[0].originalName.replace(/\.[^.]+$/, '') + '.svault'
-        : `SentraVault_${timestamp}_${itemsToExport.length}items.svault`;
-      const exportPath = exportDir + exportName;
-
-      await FileSystem.writeAsStringAsync(
-        exportPath,
-        JSON.stringify(bundle)
-      );
-
-      // Share the bundle file
-      await shareAsync(exportPath, {
-        mimeType: 'application/octet-stream',
-        dialogTitle: `Export ${itemsToExport.length} item(s)`,
-        UTI: 'public.data',
+      set({
+        containerHandle: handle,
+        isContainerOpen: true,
+        media: handle.index.items,
+        thumbnailCache: new Map(),
+        extractedFiles: new Map(),
+        loading: false,
       });
 
-      // Clean up
-      await FileSystem.deleteAsync(exportPath, { idempotent: true });
-    } catch (error) {
-      console.error('Failed to export items:', error);
-      throw error;
-    }
-  },
-
-  // Export all media into single .svault file
-  exportAllToUSB: async (vaultType) => {
-    const { media } = get();
-
-    if (media.length === 0) {
-      throw new Error('No media to export');
-    }
-
-    // Export all items as single bundle
-    await get().exportToUSB(media.map(m => m.id), vaultType);
-  },
-
-  deleteMedia: async (id) => {
-    const { media } = get();
-    const item = media.find((m) => m.id === id);
-
-    if (item) {
-      await FileSystem.deleteAsync(item.encryptedPath, { idempotent: true });
-      const newMedia = media.filter((m) => m.id !== id);
-
-      const dir = item.encryptedPath.includes('decoy_vault')
-        ? DECOY_VAULT_DIR
-        : VAULT_DIR;
-      await FileSystem.writeAsStringAsync(
-        dir + 'metadata.json',
-        JSON.stringify(newMedia)
-      );
-
-      set({ media: newMedia });
-    }
-  },
-
-  // Preview .svault file without importing (creates temp files)
-  previewVaultFile: async (fileUri) => {
-    const previewDir = FileSystem.cacheDirectory + 'preview/';
-    const dirInfo = await FileSystem.getInfoAsync(previewDir);
-    if (!dirInfo.exists) {
-      await FileSystem.makeDirectoryAsync(previewDir, { intermediates: true });
-    }
-
-    const previews: PreviewItem[] = [];
-
-    try {
-      const bundleContent = await FileSystem.readAsStringAsync(fileUri);
-      const bundle: VaultExportBundle = JSON.parse(bundleContent);
-
-      if (bundle.version !== 1 && bundle.version !== 2) {
-        throw new Error('Unsupported vault file version');
+      // Pre-load first batch of thumbnails
+      const firstBatch = handle.index.items.slice(0, 50).map((item) => item.id);
+      if (firstBatch.length > 0) {
+        get().loadThumbnails(0, 50);
       }
 
-      // Handle multi-item format (version 2)
-      if (bundle.items && Array.isArray(bundle.items)) {
-        for (let i = 0; i < bundle.items.length; i++) {
-          const item = bundle.items[i];
-          const id = `preview-${Date.now()}-${i}`;
-          const ext = getExtension(item.type, item.originalName);
-          const tempPath = previewDir + id + '.' + ext;
+      return true;
+    } catch (error) {
+      console.error('Failed to open vault:', error);
+      set({ loading: false });
+      return false;
+    }
+  },
 
-          await FileSystem.writeAsStringAsync(
+  closeVault: async () => {
+    const { containerHandle } = get();
+
+    if (containerHandle) {
+      // Save any pending changes
+      await saveContainer(containerHandle);
+    }
+
+    // Clean up all temp files
+    await cleanupTempFiles();
+
+    set({
+      containerHandle: null,
+      isContainerOpen: false,
+      media: [],
+      thumbnailCache: new Map(),
+      extractedFiles: new Map(),
+    });
+
+    console.log('Vault closed and temp files cleaned');
+  },
+
+  loadThumbnails: async (startIndex, count) => {
+    const { containerHandle, thumbnailCache } = get();
+    if (!containerHandle) return;
+
+    const items = containerHandle.index.items.slice(startIndex, startIndex + count);
+    const idsToLoad = items
+      .filter((item) => !thumbnailCache.has(item.id) && item.thumbnailPath)
+      .map((item) => item.id);
+
+    if (idsToLoad.length === 0) return;
+
+    const results = await extractThumbnails(containerHandle, idsToLoad);
+
+    set((state) => {
+      const newCache = new Map(state.thumbnailCache);
+      results.forEach((path, id) => {
+        newCache.set(id, path);
+      });
+      return { thumbnailCache: newCache };
+    });
+  },
+
+  getThumbnailPath: async (itemId) => {
+    const { containerHandle, thumbnailCache } = get();
+
+    // Check cache first
+    if (thumbnailCache.has(itemId)) {
+      return thumbnailCache.get(itemId) || null;
+    }
+
+    if (!containerHandle) return null;
+
+    // Extract from container
+    const path = await extractThumbnail(containerHandle, itemId);
+    if (path) {
+      set((state) => {
+        const newCache = new Map(state.thumbnailCache);
+        newCache.set(itemId, path);
+        return { thumbnailCache: newCache };
+      });
+    }
+
+    return path;
+  },
+
+  getFilePath: async (itemId) => {
+    const { containerHandle, extractedFiles } = get();
+
+    // Check cache first
+    if (extractedFiles.has(itemId)) {
+      const cached = extractedFiles.get(itemId)!;
+      const info = await FileSystem.getInfoAsync(cached);
+      if (info.exists) {
+        return cached;
+      }
+    }
+
+    if (!containerHandle) return null;
+
+    // Extract from container
+    const path = await extractFile(containerHandle, itemId);
+    if (path) {
+      set((state) => {
+        const newFiles = new Map(state.extractedFiles);
+        newFiles.set(itemId, path);
+        return { extractedFiles: newFiles };
+      });
+    }
+
+    return path;
+  },
+
+  importFromPhotos: async (assets) => {
+    const { containerHandle } = get();
+    if (!containerHandle) return 0;
+
+    set({ importing: true, importProgress: 0 });
+    let imported = 0;
+    const total = assets.length;
+
+    try {
+      // Phase 1: Add all files to container (without saving each time)
+      for (let i = 0; i < assets.length; i++) {
+        const asset = assets[i];
+        // Progress: 0-80% for adding files
+        set({ importProgress: Math.round((i / total) * 80) });
+
+        try {
+          // Get asset info
+          const assetInfo = await MediaLibrary.getAssetInfoAsync(asset.id);
+          const sourceUri = assetInfo.localUri || asset.uri;
+
+          if (!sourceUri) continue;
+
+          // Copy to cache for processing
+          const tempPath = FileSystem.cacheDirectory + `import_${Date.now()}_${i}`;
+          await FileSystem.copyAsync({ from: sourceUri, to: tempPath });
+
+          // Determine mime type
+          const mimeType = asset.mediaType === 'video' ? 'video/mp4' : 'image/jpeg';
+
+          // Generate thumbnail
+          const thumbnail = await generateThumbnail(tempPath, mimeType);
+
+          // Add to container (skipSave=true for batch mode)
+          await addFileToContainer(
+            containerHandle,
             tempPath,
-            item.data,
-            { encoding: FileSystem.EncodingType.Base64 }
+            asset.filename || `media_${Date.now()}`,
+            mimeType,
+            thumbnail || undefined,
+            true // skipSave - we'll save once at the end
           );
 
-          previews.push({
-            id,
-            type: item.type,
-            uri: tempPath,
-            originalName: item.originalName,
-            duration: item.duration,
-          });
+          // Clean up temp file
+          await FileSystem.deleteAsync(tempPath, { idempotent: true });
+
+          imported++;
+        } catch (itemError) {
+          console.error('Failed to import asset:', itemError);
         }
-      } else {
-        // Handle legacy single-item format (version 1)
-        const legacyBundle = bundle as any;
-        const id = `preview-${Date.now()}-0`;
-        const ext = getExtension(legacyBundle.type, legacyBundle.originalName);
-        const tempPath = previewDir + id + '.' + ext;
-
-        await FileSystem.writeAsStringAsync(
-          tempPath,
-          legacyBundle.data,
-          { encoding: FileSystem.EncodingType.Base64 }
-        );
-
-        previews.push({
-          id,
-          type: legacyBundle.type,
-          uri: tempPath,
-          originalName: legacyBundle.originalName,
-          duration: legacyBundle.duration,
-        });
       }
 
-      return previews;
+      // Phase 2: Save container once (80-100% progress)
+      if (imported > 0) {
+        set({ importProgress: 85 });
+        await saveContainer(containerHandle);
+        set({ importProgress: 100 });
+      }
+
+      // Refresh media list
+      set({
+        media: containerHandle.index.items,
+        importing: false,
+        importProgress: 100,
+      });
+
+      return imported;
     } catch (error) {
-      console.error('Failed to preview vault file:', error);
-      throw error;
+      console.error('Failed to import from photos:', error);
+      set({ importing: false, importProgress: 0 });
+      return 0;
     }
   },
 
-  // Clean up preview temp files
-  cleanupPreviews: async () => {
-    const previewDir = FileSystem.cacheDirectory + 'preview/';
+  importFromFiles: async (files) => {
+    const { containerHandle } = get();
+    if (!containerHandle) return 0;
+
+    set({ importing: true, importProgress: 0 });
+    let imported = 0;
+    const total = files.length;
+
     try {
-      await FileSystem.deleteAsync(previewDir, { idempotent: true });
+      // Phase 1: Add all files to container (without saving each time)
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        // Progress: 0-80% for adding files
+        set({ importProgress: Math.round((i / total) * 80) });
+
+        try {
+          // Generate thumbnail for images
+          let thumbnail: string | null = null;
+          if (file.mimeType.startsWith('image/')) {
+            thumbnail = await generateThumbnail(file.uri, file.mimeType);
+          }
+
+          // Add to container (skipSave=true for batch mode)
+          await addFileToContainer(
+            containerHandle,
+            file.uri,
+            file.name,
+            file.mimeType,
+            thumbnail || undefined,
+            true // skipSave - we'll save once at the end
+          );
+
+          imported++;
+        } catch (itemError) {
+          console.error('Failed to import file:', itemError);
+        }
+      }
+
+      // Phase 2: Save container once (80-100% progress)
+      if (imported > 0) {
+        set({ importProgress: 85 });
+        await saveContainer(containerHandle);
+        set({ importProgress: 100 });
+      }
+
+      // Refresh media list
+      set({
+        media: containerHandle.index.items,
+        importing: false,
+        importProgress: 100,
+      });
+
+      return imported;
     } catch (error) {
-      console.error('Failed to cleanup previews:', error);
+      console.error('Failed to import files:', error);
+      set({ importing: false, importProgress: 0 });
+      return 0;
+    }
+  },
+
+  importSvaultFile: async (svaultUri, password, secretKey) => {
+    const { containerHandle } = get();
+    if (!containerHandle) return 0;
+
+    set({ importing: true, importProgress: 0 });
+
+    try {
+      const imported = await importFromSvault(containerHandle, svaultUri, password, secretKey);
+
+      // Refresh media list
+      set({
+        media: containerHandle.index.items,
+        importing: false,
+        importProgress: 100,
+      });
+
+      return imported;
+    } catch (error) {
+      console.error('Failed to import .svault file:', error);
+      set({ importing: false, importProgress: 0 });
+      return 0;
+    }
+  },
+
+  deleteMedia: async (ids) => {
+    const { containerHandle } = get();
+    if (!containerHandle) return;
+
+    for (const id of ids) {
+      await deleteFromContainer(containerHandle, id);
+    }
+
+    // Refresh media list
+    set({
+      media: containerHandle.index.items,
+    });
+  },
+
+  exportVault: async () => {
+    const { containerHandle } = get();
+    if (!containerHandle) {
+      throw new Error('No vault open');
+    }
+
+    // Save any pending changes
+    await saveContainer(containerHandle);
+
+    // Get vault type from auth store
+    const { vaultType } = useAuthStore.getState();
+    return getContainerPath(vaultType || 'real');
+  },
+
+  exportSelection: async (ids, password, secretKey) => {
+    const { containerHandle } = get();
+    if (!containerHandle) {
+      throw new Error('No vault open');
+    }
+
+    return await exportSelection(containerHandle, ids, password, secretKey);
+  },
+
+  refreshMedia: async () => {
+    const { containerHandle } = get();
+    if (containerHandle) {
+      set({ media: containerHandle.index.items });
     }
   },
 }));
