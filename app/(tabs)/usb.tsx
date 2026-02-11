@@ -13,20 +13,20 @@ import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Sharing from 'expo-sharing';
 import * as Haptics from 'expo-haptics';
+import * as DocumentPicker from 'expo-document-picker';
 import { useAuthStore } from '../../src/store';
 import { useMediaStore } from '../../src/store/mediaStore';
 import { colors, spacing, radius } from '../../src/theme';
-import { getContainerPath } from '../../src/utils/containerFormat';
 
 export default function USBScreen() {
-  const { vaultType, getCredentials } = useAuthStore();
-  const { media, exportVault, exportSelection } = useMediaStore();
+  const { vaultType } = useAuthStore();
+  const { media, exportVault, importSvaultFile } = useMediaStore();
 
   const [loading, setLoading] = useState(false);
-  const [action, setAction] = useState<'exportAll' | 'exportSelection' | null>(null);
+  const [action, setAction] = useState<'export' | 'import' | null>(null);
 
-  // Export entire vault (share the container file)
-  const handleExportAll = async () => {
+  // Export entire vault backup
+  const handleExportBackup = async () => {
     if (media.length === 0) {
       Alert.alert('Empty Vault', 'Your vault is empty. Add some files first.');
       return;
@@ -35,15 +35,15 @@ export default function USBScreen() {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
     Alert.alert(
-      'Export Vault',
-      `Share your entire vault (${media.length} items) as a .svault file?`,
+      'Export Backup',
+      `Export your entire vault (${media.length} items) as a .svault backup file?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Export',
           onPress: async () => {
             setLoading(true);
-            setAction('exportAll');
+            setAction('export');
             try {
               const vaultPath = await exportVault();
 
@@ -55,7 +55,7 @@ export default function USBScreen() {
 
               await Sharing.shareAsync(vaultPath, {
                 mimeType: 'application/octet-stream',
-                dialogTitle: 'Export Vault',
+                dialogTitle: 'Export Vault Backup',
                 UTI: 'public.data',
               });
 
@@ -74,65 +74,71 @@ export default function USBScreen() {
     );
   };
 
-  // Export selected items (create new .svault with selection)
-  const handleExportSelection = async () => {
-    if (media.length === 0) {
-      Alert.alert('Empty Vault', 'Your vault is empty. Add some files first.');
-      return;
-    }
-
+  // Import from .svault file
+  const handleImportSvault = async () => {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
-    // For now, export all - in future can add selection UI
-    const credentials = getCredentials();
-    if (!credentials) {
-      Alert.alert('Error', 'Not authenticated');
-      return;
-    }
+    try {
+      // Pick .svault file
+      const result = await DocumentPicker.getDocumentAsync({
+        type: '*/*',
+        copyToCacheDirectory: true,
+      });
 
-    Alert.alert(
-      'Export Selection',
-      'This will create a new .svault file with all items. In a future update, you can select specific items to export.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Export All',
-          onPress: async () => {
-            setLoading(true);
-            setAction('exportSelection');
-            try {
-              const allIds = media.map((m) => m.id);
-              const exportPath = await exportSelection(
-                allIds,
-                credentials.password,
-                credentials.secretKey
-              );
+      if (result.canceled || !result.assets || result.assets.length === 0) {
+        return;
+      }
 
-              const isAvailable = await Sharing.isAvailableAsync();
-              if (!isAvailable) {
-                Alert.alert('Error', 'Sharing is not available on this device');
-                return;
+      const file = result.assets[0];
+
+      // Check if it's a .svault file
+      if (!file.name.endsWith('.svault') && !file.name.endsWith('.vault')) {
+        Alert.alert(
+          'Invalid File',
+          'Please select a .svault or .vault backup file.',
+          [{ text: 'OK' }]
+        );
+        return;
+      }
+
+      Alert.alert(
+        'Import Backup',
+        `Import items from "${file.name}"? This will add them to your current vault.`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Import',
+            onPress: async () => {
+              setLoading(true);
+              setAction('import');
+              try {
+                const importedCount = await importSvaultFile(file.uri);
+
+                if (importedCount > 0) {
+                  await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                  Alert.alert('Success', `Imported ${importedCount} item(s) from backup.`);
+                } else {
+                  Alert.alert('No Items', 'No items were imported. The file may be empty or incompatible.');
+                }
+              } catch (error) {
+                console.error('Import failed:', error);
+                await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+                Alert.alert(
+                  'Import Failed',
+                  'Failed to import the backup. Make sure the file is a valid .svault backup and you are using the correct password.'
+                );
+              } finally {
+                setLoading(false);
+                setAction(null);
               }
-
-              await Sharing.shareAsync(exportPath, {
-                mimeType: 'application/octet-stream',
-                dialogTitle: 'Export Selection',
-                UTI: 'public.data',
-              });
-
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-            } catch (error) {
-              console.error('Export failed:', error);
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-              Alert.alert('Error', 'Failed to export selection');
-            } finally {
-              setLoading(false);
-              setAction(null);
-            }
+            },
           },
-        },
-      ]
-    );
+        ]
+      );
+    } catch (error) {
+      console.error('File picker error:', error);
+      Alert.alert('Error', 'Failed to pick file');
+    }
   };
 
   return (
@@ -146,26 +152,28 @@ export default function USBScreen() {
           <Text style={styles.subtitle}>{media.length} items in vault</Text>
         </View>
 
-        {/* Export Section */}
+        {/* Actions Section */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Export Options</Text>
+          <Text style={styles.sectionTitle}>Backup & Restore</Text>
 
           <ActionRow
-            icon="cloud-download-outline"
-            title="Export Entire Vault"
-            subtitle="Share your vault.svault file"
-            onPress={handleExportAll}
-            loading={loading && action === 'exportAll'}
+            icon="cloud-upload-outline"
+            title="Export Backup"
+            subtitle="Save your entire vault as a .svault file"
+            onPress={handleExportBackup}
+            loading={loading && action === 'export'}
             disabled={loading || media.length === 0}
+            color={colors.primary}
           />
 
           <ActionRow
-            icon="document-attach-outline"
-            title="Export Selection"
-            subtitle="Create new .svault with selected items"
-            onPress={handleExportSelection}
-            loading={loading && action === 'exportSelection'}
-            disabled={loading || media.length === 0}
+            icon="cloud-download-outline"
+            title="Import from Backup"
+            subtitle="Restore from a .svault file"
+            onPress={handleImportSvault}
+            loading={loading && action === 'import'}
+            disabled={loading}
+            color={colors.success}
           />
         </View>
 
@@ -176,8 +184,8 @@ export default function USBScreen() {
             <View style={styles.infoContent}>
               <Text style={styles.infoTitle}>About .svault files</Text>
               <Text style={styles.infoText}>
-                Your vault is stored as an encrypted .svault file. You can share this file to back
-                it up, then import it later using the + button on the Vault tab.
+                Your vault is stored as an encrypted .svault file. Export it to back up your data,
+                then import it on this or another device.
               </Text>
             </View>
           </View>
@@ -189,6 +197,17 @@ export default function USBScreen() {
               <Text style={styles.infoText}>
                 Files are encrypted with AES-256. You'll need your password to access them on
                 another device.
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.infoCard}>
+            <Ionicons name="share-outline" size={24} color={colors.textSecondary} />
+            <View style={styles.infoContent}>
+              <Text style={styles.infoTitle}>Export Selection</Text>
+              <Text style={styles.infoText}>
+                To export specific items, go to Vault tab, long-press to select items, then tap
+                the share icon.
               </Text>
             </View>
           </View>
@@ -205,9 +224,10 @@ interface ActionRowProps {
   onPress: () => void;
   loading?: boolean;
   disabled?: boolean;
+  color?: string;
 }
 
-function ActionRow({ icon, title, subtitle, onPress, loading, disabled }: ActionRowProps) {
+function ActionRow({ icon, title, subtitle, onPress, loading, disabled, color }: ActionRowProps) {
   return (
     <TouchableOpacity
       style={[styles.actionRow, disabled && styles.actionRowDisabled]}
@@ -215,8 +235,8 @@ function ActionRow({ icon, title, subtitle, onPress, loading, disabled }: Action
       disabled={disabled}
       activeOpacity={0.6}
     >
-      <View style={styles.actionIcon}>
-        <Ionicons name={icon} size={22} color={disabled ? colors.textTertiary : colors.text} />
+      <View style={[styles.actionIcon, color && { backgroundColor: color + '20' }]}>
+        <Ionicons name={icon} size={22} color={disabled ? colors.textTertiary : (color || colors.text)} />
       </View>
       <View style={styles.actionContent}>
         <Text style={[styles.actionTitle, disabled && styles.textDisabled]}>{title}</Text>

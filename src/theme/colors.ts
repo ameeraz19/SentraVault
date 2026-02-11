@@ -1,26 +1,32 @@
-// Minimal dark theme - neutral with single accent
+// Premium dark theme - sophisticated, deep, and vibrant
 export const colors = {
   // Backgrounds
-  background: '#000000',
-  surface: '#161616',
-  surfaceSecondary: '#1C1C1C',
+  background: '#050505', // Almost black, very deep grey
+  surface: '#121212', // Material Dark standard
+  surfaceSecondary: '#1E1E1E', // Slightly lighter for cards/inputs
+  surfaceTertiary: '#2C2C2E', // For modals or elevated surfaces
 
-  // Primary accent (single color for focus)
-  primary: '#007AFF',
+  // Primary accent (Vibrant Blue-Violet gradient feel)
+  primary: '#4D88FF', // Bright, legible blue
+  primaryDark: '#0055D4', // Darker shade for press states
+  primaryLight: '#8FB5FF', // Lighter shade for highlights
 
   // Semantic states
-  success: '#34C759',
-  error: '#FF3B30',
+  success: '#32D74B', // iOS green
+  error: '#FF453A', // iOS red
+  warning: '#FFD60A', // iOS yellow
+  info: '#64D2FF', // iOS cyan
 
-  // Text hierarchy (3 levels)
+  // Text hierarchy
   text: '#FFFFFF',
-  textSecondary: '#8E8E93',
-  textTertiary: '#48484A',
+  textSecondary: '#EBEBF5', // 60% white
+  textTertiary: '#EBEBF599', // 30% white (using hex alpha for better blending)
 
-  // Borders (subtle)
-  border: '#2C2C2E',
-  separator: '#1C1C1E',
+  // Borders & Separators
+  border: '#38383A',
+  separator: '#38383A', // Subtle divider
 
-  // Overlays
-  overlay: 'rgba(0, 0, 0, 0.8)',
+  // Overlays & Glass
+  overlay: 'rgba(0, 0, 0, 0.75)',
+  glass: 'rgba(30, 30, 30, 0.6)', // For blur effects
 } as const;

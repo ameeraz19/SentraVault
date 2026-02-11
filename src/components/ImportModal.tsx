@@ -48,8 +48,12 @@ interface ImportModalProps {
 export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) {
   const insets = useSafeAreaInsets();
   const { getCredentials } = useAuthStore();
-  const { importFromPhotos, importFromFiles, importSvaultFile, importing, importProgress } =
+  const { importFromPhotos, importFromFiles, importSvaultFile, importing, encryptionProgress } =
     useMediaStore();
+
+  const importProgress = encryptionProgress.total > 0
+    ? (encryptionProgress.current / encryptionProgress.total) * 100
+    : 0;
 
   const [activeTab, setActiveTab] = useState<TabType>('photos');
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
@@ -189,10 +193,11 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
         selectedAssets.push(asset);
       }
 
-      const imported = await importFromPhotos(selectedAssets);
+      // Start import - this copies files to temp instantly and encrypts in background
+      const copiedCount = await importFromPhotos(selectedAssets);
 
+      // Close modal IMMEDIATELY - encryption happens in background
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      Alert.alert('Import Complete', `${imported} item(s) added to vault`);
       handleClose();
       setTimeout(() => onComplete(), 300);
     } catch (error) {
@@ -222,7 +227,7 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
 
       let totalImported = 0;
 
-      // Import regular files
+      // Import regular files - this copies to temp instantly, encrypts in background
       if (regularFiles.length > 0) {
         const files = regularFiles.map((f) => ({
           uri: f.uri,
@@ -234,19 +239,9 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
 
       // Import .svault files
       if (svaultFiles.length > 0) {
-        const credentials = getCredentials();
-        if (!credentials) {
-          Alert.alert('Error', 'Cannot import .svault files - not authenticated');
-          return;
-        }
-
         for (const svaultFile of svaultFiles) {
           try {
-            const imported = await importSvaultFile(
-              svaultFile.uri,
-              credentials.password,
-              credentials.secretKey
-            );
+            const imported = await importSvaultFile(svaultFile.uri);
             totalImported += imported;
           } catch (error) {
             console.error('Failed to import .svault file:', error);
@@ -258,9 +253,9 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
         }
       }
 
-      if (totalImported > 0) {
+      // Close modal IMMEDIATELY - encryption happens in background
+      if (totalImported > 0 || regularFiles.length > 0) {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        Alert.alert('Import Complete', `${totalImported} item(s) added to vault`);
         handleClose();
         setTimeout(() => onComplete(), 300);
       } else {
@@ -488,7 +483,7 @@ export function ImportModal({ visible, onClose, onComplete }: ImportModalProps) 
 const styles = StyleSheet.create({
   backdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    backgroundColor: colors.overlay,
   },
   container: {
     flex: 1,

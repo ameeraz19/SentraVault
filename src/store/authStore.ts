@@ -67,6 +67,18 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
   setupVault: async (realPassword, decoyPassword) => {
     try {
+      // We no longer store password hashes. 
+      // We JUST verify if we can unpack the vault with the password.
+      // But for "SETUP", we just want to flag that setup is done.
+      // The actual vault creation happens when we try to "open" (and it creates) 
+      // OR we can explicitly create them here.
+
+      // For SVault v2 with Master Key, we don't need to store hashes in SecureStore 
+      // to "verify" the password. The verification IS the successful unwrapping of the Master Key.
+
+      // However, to support "Decoy" vs "Real", we need to know WHICH one it is before opening.
+      // So we will keep the hash storage for fast differentiation.
+
       const salt = await Crypto.digestStringAsync(
         Crypto.CryptoDigestAlgorithm.SHA256,
         Date.now().toString()
@@ -80,7 +92,6 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       await SecureStore.setItemAsync('sv2_decoy_hash', decoyHash);
       await SecureStore.setItemAsync('sv2_setup_complete', 'true');
 
-      // Ensure secret key is generated and stored
       const secretKey = await getSecretKey();
 
       const { biometricsAvailable } = get();
@@ -139,23 +150,20 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         return false;
       }
 
-      // Open the vault container
+      // INSTANT login - just store credentials, don't open container yet
+      // Container will be opened lazily when user needs thumbnails/files
       const mediaStore = useMediaStore.getState();
-      const opened = await mediaStore.openVault(password, secretKey, vaultType);
-
-      if (!opened) {
-        set({ error: 'Failed to open vault' });
-        return false;
-      }
+      mediaStore.setVaultCredentials(password, secretKey, vaultType);
 
       set({
         authState: 'unlocked',
         vaultType,
-        password, // Store temporarily for export operations
+        password,
         secretKey,
         error: null,
       });
 
+      console.log('Login instant - vault unlocked');
       return true;
     } catch (error) {
       console.error('Authentication error:', error);
@@ -165,9 +173,16 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   lock: async () => {
-    // Close the vault container and clean up temp files
+    // Close the vault and clean up temp files
     const mediaStore = useMediaStore.getState();
-    await mediaStore.closeVault();
+    await mediaStore.closeVaultAsync();
+
+    // WIPE SESSION DATA
+    // We import this dynamically or move the clearSession into mediaStore's closeVaultAsync
+    // For now, let's assume mediaStore.closeVaultAsync handles the heavy lifting,
+    // but strict hygiene is good.
+    const { clearSession } = require('../utils/svaultFormat');
+    await clearSession();
 
     const { biometricsAvailable } = get();
     set({

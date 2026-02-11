@@ -5,6 +5,7 @@ import {
   ActivityIndicator,
   ViewStyle,
   TextStyle,
+  View,
 } from 'react-native';
 import { colors, spacing, radius } from '../../theme';
 
@@ -15,6 +16,7 @@ interface ButtonProps {
   disabled?: boolean;
   loading?: boolean;
   style?: ViewStyle;
+  icon?: React.ReactNode;
 }
 
 export function Button({
@@ -24,6 +26,7 @@ export function Button({
   disabled = false,
   loading = false,
   style,
+  icon,
 }: ButtonProps) {
   const buttonStyles = [
     styles.base,
@@ -52,7 +55,10 @@ export function Button({
           size="small"
         />
       ) : (
-        <Text style={textStyles}>{title}</Text>
+        <View style={styles.contentContainer}>
+          {icon && <View style={styles.iconContainer}>{icon}</View>}
+          <Text style={textStyles}>{title}</Text>
+        </View>
       )}
     </TouchableOpacity>
   );
@@ -65,6 +71,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: spacing.lg,
+  },
+  contentContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  iconContainer: {
+    marginRight: spacing.xs,
   },
   primary: {
     backgroundColor: colors.primary,
@@ -98,3 +112,4 @@ const styles = StyleSheet.create({
     color: colors.error,
   },
 });
+

@@ -325,7 +325,7 @@ const styles = StyleSheet.create({
     zIndex: 10,
     paddingHorizontal: spacing.lg,
     paddingBottom: spacing.md,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: colors.overlay,
   },
   headerContent: {
     alignItems: 'center',
@@ -382,7 +382,7 @@ const styles = StyleSheet.create({
     right: spacing.lg,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: colors.overlay,
     borderRadius: 8,
   },
   closeButtonText: {
